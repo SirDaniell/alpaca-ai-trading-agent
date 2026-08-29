@@ -16,12 +16,16 @@ from app.agent.loop import run_cycle
 from app.core.options.q_executor import ACTION_BUY_CALL
 
 
+@patch("app.agent.loop.AlpacaCLIWrapper")
 @patch("app.agent.loop.AlpacaClient")
 @patch("app.agent.loop.SessionLocal")
-def test_agent_loop_full_options_execution_cycle(mock_session_cls, mock_client_cls):
+def test_agent_loop_full_options_execution_cycle(mock_session_cls, mock_client_cls, mock_cli_cls):
     # Setup mock Alpaca client
     mock_client = MagicMock()
     mock_client_cls.return_value = mock_client
+
+    mock_cli = MagicMock()
+    mock_cli_cls.return_value = mock_cli
 
     mock_client.is_market_open.return_value = True
     mock_client.get_account.return_value = {
@@ -47,11 +51,11 @@ def test_agent_loop_full_options_execution_cycle(mock_session_cls, mock_client_c
     mock_client.get_bars.return_value = bars
 
     # Mock option order response
-    mock_client.place_option_order.return_value = {
+    mock_cli.submit_order.return_value = {
         "id": "mock_order_123",
         "symbol": "SPY260918C00500000",
         "status": "accepted",
-        "qty": "1",
+        "qty": 1,
         "side": "buy",
     }
 
@@ -66,12 +70,13 @@ def test_agent_loop_full_options_execution_cycle(mock_session_cls, mock_client_c
     # Assertions
     assert mock_client.is_market_open.called
     assert mock_client.get_account.called
-    assert mock_client.place_option_order.called, "Option order must be placed when action is BUY_CALL"
+    assert mock_cli.submit_order.called, "Option order must be placed via AlpacaCLIWrapper when action is BUY_CALL"
 
     # Verify option order payloads
-    assert mock_client.place_option_order.call_count >= 1
-    placed_symbols = [c.kwargs["symbol"] for c in mock_client.place_option_order.call_args_list]
+    assert mock_cli.submit_order.call_count >= 1
+    placed_symbols = [c.kwargs["symbol"] for c in mock_cli.submit_order.call_args_list]
     assert any("SPY" in sym or "TSLA" in sym for sym in placed_symbols)
+
 
     # Verify DB commit
     assert mock_db.add.called

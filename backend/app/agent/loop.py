@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 
 from app.utils.alpaca_client import AlpacaClient
+from app.utils.alpaca_cli_wrapper import AlpacaCLIWrapper
 from app.core.market.mtf_rsi import calculate_wilder_rsi
 from app.core.market.divergence_scale import build_unified_divergence_scale
 from app.core.market.signal_events import build_signal_bundle
@@ -116,13 +117,15 @@ def check_hard_risk_gates(account: AccountContext, positions_count: int) -> bool
 
 
 def run_cycle():
-    """Execute one complete trading loop cycle: fetch data, run Tier 1/2 models, check risk gates, execute orders."""
+    """Execute one complete trading loop cycle: fetch data, run Tier 1/2 models, check risk gates, execute orders via Alpaca CLI."""
     if not SYMBOLS:
         logger.warning("No symbols configured")
         return
 
     client = AlpacaClient()
+    cli_wrapper = AlpacaCLIWrapper()
     db = SessionLocal()
+
 
     # Check if market is open
     if not client.is_market_open():
@@ -206,15 +209,15 @@ def run_cycle():
             # 6. Check Non-Bypassable Hard Risk Gates
             risk_ok = check_hard_risk_gates(account_ctx, positions_count)
 
-            # 7. Execute Options Order if action is BUY_CALL or BUY_PUT
+            # 7. Execute Options Order via Alpaca CLI Wrapper if action is BUY_CALL or BUY_PUT
             if risk_ok and chosen_action in (ACTION_BUY_CALL, ACTION_BUY_PUT):
                 opt_type = "call" if chosen_action == ACTION_BUY_CALL else "put"
                 target_contract = select_target_option_contract(symbol, current_close, opt_type)
                 occ_ticker = target_contract["occ_symbol"]
 
-                logger.info(f"🚀 EXECUTING OPTION ORDER: {occ_ticker} (Type: {opt_type.upper()}, Strike: ${target_contract['strike_price']})")
-                order_res = client.place_option_order(symbol=occ_ticker, qty=1, side="buy")
-                logger.info(f"Order Response: {order_res}")
+                logger.info(f"🚀 EXECUTING OPTION ORDER VIA CLI: {occ_ticker} (Type: {opt_type.upper()}, Strike: ${target_contract['strike_price']})")
+                order_res = cli_wrapper.submit_order(symbol=occ_ticker, side="buy", qty=1, is_option=True)
+                logger.info(f"CLI Order Response: {order_res}")
 
             elif chosen_action in (ACTION_TAKE_PROFIT_HALF, ACTION_CLOSE_FLATTEN) and positions:
                 first_pos = positions[0]
@@ -222,9 +225,10 @@ def run_cycle():
                 pos_qty = int(first_pos.get("qty", 1))
                 close_qty = max(1, pos_qty // 2) if chosen_action == ACTION_TAKE_PROFIT_HALF else pos_qty
 
-                logger.info(f"🛑 CLOSING OPTION POSITION: {pos_sym} Qty: {close_qty}")
-                order_res = client.place_option_order(symbol=pos_sym, qty=close_qty, side="sell")
-                logger.info(f"Close Response: {order_res}")
+                logger.info(f"🛑 CLOSING OPTION POSITION VIA CLI: {pos_sym} Qty: {close_qty}")
+                order_res = cli_wrapper.submit_order(symbol=pos_sym, side="sell", qty=close_qty, is_option=True)
+                logger.info(f"CLI Close Response: {order_res}")
+
 
             # 8. Log outcome to DB
             outcome = SignalOutcome(
