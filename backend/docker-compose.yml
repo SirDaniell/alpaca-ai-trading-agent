@@ -1,0 +1,49 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: lablab_postgres
+    environment:
+      POSTGRES_USER: lablab_user
+      POSTGRES_PASSWORD: lablab_pass
+      POSTGRES_DB: lablab_trading
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lablab_user -d lablab_trading"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lablab_backend
+    environment:
+      DATABASE_URL: postgresql://lablab_user:lablab_pass@postgres:5432/lablab_trading
+      ALPACA_API_KEY: ${ALPACA_API_KEY}
+      ALPACA_SECRET_KEY: ${ALPACA_SECRET_KEY}
+      ALPACA_BASE_URL: https://paper-api.alpaca.markets
+      BACKEND_HOST: 0.0.0.0
+      BACKEND_PORT: 8000
+      DEBUG: "False"
+      AGENT_LOOP_ENABLED: "True"
+      AGENT_LOOP_INTERVAL_SECONDS: "300"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: >
+      sh -c "python -m alembic upgrade head &&
+             python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+volumes:
+  postgres_data:
+    driver: local

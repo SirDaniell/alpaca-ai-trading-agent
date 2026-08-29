@@ -1,0 +1,16 @@
+alpaca-py
+python-dotenv
+fastapi
+uvicorn[standard]
+apscheduler
+requests
+sqlalchemy
+psycopg2-binary
+numpy
+pandas
+matplotlib
+scikit-learn
+tqdm
+pandas-ta
+torch
+pytest
