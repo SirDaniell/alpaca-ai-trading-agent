@@ -12,7 +12,7 @@ All output is deterministic (seed-based) for reproducibility.
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 import random
 import math
@@ -80,8 +80,9 @@ class SyntheticDataGenerator:
         Returns:
             List of Candle objects
         """
+        random.seed(self.seed)
         if start_time is None:
-            start_time = datetime.utcnow() - timedelta(seconds=num_candles * interval_seconds)
+            start_time = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc) - timedelta(seconds=num_candles * interval_seconds)
         
         logger.info(
             f"Generating {num_candles} candles for {symbol} "

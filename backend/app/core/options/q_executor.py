@@ -32,8 +32,7 @@ ACTION_BUY_PUT = 2
 ACTION_TAKE_PROFIT_HALF = 3
 ACTION_CLOSE_FLATTEN = 4
 NUM_ACTIONS = 5
-
-EXECUTOR_STATE_DIM = 24  # Compact representation for LTF execution context
+EXECUTOR_STATE_DIM = 28  # Compact representation for LTF execution context + Multi-Horizon hints
 
 
 @dataclass
@@ -45,6 +44,10 @@ class HTFBiasPackage:
     q_value: float = 0.0
     expected_mfe_pips: float = 0.0
     expected_mae_pips: float = 0.0
+    # Multi-Horizon Hints
+    horizon_strengths: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5, 0.5])
+    optimal_horizon_idx: int = 2
+    recommended_expiry: str = "30m"
 
 
 @dataclass
@@ -82,11 +85,11 @@ class ExecutorQNetwork(nn.Module):
     """
     Two-Branch Ensemble Deep Q-Network for LTF Options Execution.
     Mirrors build_classification_ensemble_model (tt.py) architecture:
-    - Branch 1 (Dense Feature Tower): Deep representation over all 24 state features with LayerNorm & SiLU.
-    - Branch 2 (Multi-Scale Grouped Tower): Grouped projections over Meta-Learner (0..5), Risk (6..10), Zone (11..18), and Time (19..23) features.
+    - Branch 1 (Dense Feature Tower): Deep representation over all 28 state features with LayerNorm & SiLU.
+    - Branch 2 (Multi-Scale Grouped Tower): Grouped projections over Meta-Learner (0..9), Risk (10..14), Zone (15..22), and Time (23..27) features.
     - Supervised Aux Heads (aux1_head, aux2_head): Independent aux predictions per branch before fusion.
     - StopGradient Isolation: aux1 & aux2 predictions are detached before feeding into Gated Fusion Layer.
-    - Gated Fusion Head: Combines b1_out, b2_out, aux1_detached, aux2_detached for robust Q-value estimation.
+    - Gated Ensemble Fusion Head: Combines b1_out, b2_out, aux1_detached, aux2_detached for robust Q-value estimation.
     """
 
     def __init__(self, input_dim: int = EXECUTOR_STATE_DIM, hidden_dim: int = 128, num_actions: int = NUM_ACTIONS):
@@ -101,8 +104,8 @@ class ExecutorQNetwork(nn.Module):
         self.b1_act2 = nn.SiLU()
 
         # Branch 2: Multi-Scale Grouped Feature Tower
-        # Slice inputs into 4 semantic sub-groups: Meta (6), Risk (5), Zone (8), Time (5)
-        self.b2_meta = nn.Linear(6, 32)
+        # Slice inputs into 4 semantic sub-groups: Meta (10), Risk (5), Zone (8), Time (5)
+        self.b2_meta = nn.Linear(10, 32)
         self.b2_risk = nn.Linear(5, 32)
         self.b2_zone = nn.Linear(8, 32)
         self.b2_time = nn.Linear(5, 32)
@@ -128,10 +131,10 @@ class ExecutorQNetwork(nn.Module):
         b1_out = self.b1_act2(self.b1_ln2(self.b1_fc2(b1)))
 
         # ── Branch 2 ────────────────────────────────────────────────────────
-        meta_feats = x[:, :6]
-        risk_feats = x[:, 6:11]
-        zone_feats = x[:, 11:19]
-        time_feats = x[:, 19:24]
+        meta_feats = x[:, :10]
+        risk_feats = x[:, 10:15]
+        zone_feats = x[:, 15:23]
+        time_feats = x[:, 23:28]
 
         b2_m = torch.relu(self.b2_meta(meta_feats))
         b2_r = torch.relu(self.b2_risk(risk_feats))
@@ -202,8 +205,8 @@ class OptionsQExecutor:
         zone_manager: ZoneSnapshotManager,
     ) -> np.ndarray:
         """
-        Construct a normalized 24-dim state vector representing the full LTF execution context,
-        including HTF Bias, SNR Zone Proximity, Zonal Volume, Account State, and Time/Session Features.
+        Construct a normalized 28-dim state vector representing the full LTF execution context,
+        including HTF Bias, Multi-Horizon Meta hints (5m, 15m, 30m, 1h), SNR Zone Proximity, Zonal Volume, Account State, and Time/Session Features.
         """
         nearest_supp, nearest_res = zone_manager.get_nearest_zones(exec_ctx.current_price)
 
@@ -219,6 +222,9 @@ class OptionsQExecutor:
         tf_flag = 1.0 if exec_ctx.ltf_timeframe == "15m" else 0.0
         dir_flag = 1.0 if htf_bias.direction == "bullish" else (-1.0 if htf_bias.direction == "bearish" else 0.0)
 
+        # Multi-Horizon Strengths (5m, 15m, 30m, 1h)
+        hs = htf_bias.horizon_strengths if len(htf_bias.horizon_strengths) == 4 else [0.5, 0.5, 0.5, 0.5]
+
         # Time & Session cyclical encodings & flags
         sin_hour = float(np.sin(2 * np.pi * exec_ctx.hour_of_day / 24.0))
         cos_hour = float(np.cos(2 * np.pi * exec_ctx.hour_of_day / 24.0))
@@ -227,19 +233,24 @@ class OptionsQExecutor:
         is_power_hour = 1.0 if exec_ctx.session_phase == "nyse_power_hour" else 0.0
 
         state = np.array([
+            # Meta & Multi-Horizon Hints (10 features)
             dir_flag,
             float(htf_bias.strength),
             float(htf_bias.reversal_prob),
             float(htf_bias.q_value),
             float(htf_bias.expected_mfe_pips) / 100.0,
             float(htf_bias.expected_mae_pips) / 100.0,
-            # Account context
+            float(hs[0]),
+            float(hs[1]),
+            float(hs[2]),
+            float(hs[3]),
+            # Account Context (5 features)
             float(account.daily_drawdown_pct),
             1.0 if account.open_position_type == "CALL" else (-1.0 if account.open_position_type == "PUT" else 0.0),
             float(account.open_position_pnl_pct),
             float(account.win_streak) / 10.0,
             float(account.loss_streak) / 10.0,
-            # Execution & Zone Context
+            # Execution & Zone Context (8 features)
             tf_flag,
             float(exec_ctx.atr) / exec_ctx.current_price,
             float(supp_dist),
@@ -248,7 +259,7 @@ class OptionsQExecutor:
             float(res_vol_ratio),
             float(vol_delta_ratio),
             float(exec_ctx.reentries_in_window) / float(exec_ctx.max_reentries_allowed),
-            # Time & Session Context
+            # Time & Session Context (5 features)
             sin_hour,
             cos_hour,
             dow_norm,
@@ -257,6 +268,7 @@ class OptionsQExecutor:
         ], dtype=np.float32)
 
         return state
+
 
 
     # ── Action Selection with Hard Action Masking ─────────────────────────────

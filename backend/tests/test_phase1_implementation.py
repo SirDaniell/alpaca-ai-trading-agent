@@ -310,8 +310,8 @@ class TestAsyncAndLogging:
     
     def test_logging_present(self, caplog):
         """Test that logging is produced."""
-        gen = SyntheticDataGenerator(seed=42)
         with caplog.at_level(logging.INFO):
+            gen = SyntheticDataGenerator(seed=42)
             candles = gen.generate_session("AAPL", num_candles=10)
         
         # Should have logged initialization and generation

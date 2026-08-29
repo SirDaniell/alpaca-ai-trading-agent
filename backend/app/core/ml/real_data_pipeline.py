@@ -37,7 +37,7 @@ class RealTrainConfig:
     symbols: Tuple[str, ...] = ("GLD", "BTC/USD")
     primary_tf: str = "5m"
     timeframes: Tuple[str, ...] = ("5m", "15m", "1h", "4h", "1d")
-    target_rows_per_tf: int = 10000
+    target_rows_per_tf: int = 40000
     meta_train_steps: int = 100
     q_train_steps: int = 100
     batch_size: int = 32

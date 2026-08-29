@@ -27,14 +27,16 @@ logger = logging.getLogger("TrainPipelineReal")
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--meta-steps", type=int, default=50, help="Meta-Learner training steps per symbol")
-    parser.add_argument("--q-steps", type=int, default=50, help="Options Q-Learner training steps per symbol")
+    parser.add_argument("--meta-steps", type=int, default=300, help="Meta-Learner training steps per symbol")
+    parser.add_argument("--q-steps", type=int, default=300, help="Options Q-Learner training steps per symbol")
+    parser.add_argument("--target-rows", type=int, default=40000, help="Number of candles/rows per timeframe")
     parser.add_argument("--batch-size", type=int, default=32)
     args = parser.parse_args()
 
     init_db()
     config = RealTrainConfig(
         symbols=("GLD", "BTC/USD"),
+        target_rows_per_tf=args.target_rows,
         meta_train_steps=args.meta_steps,
         q_train_steps=args.q_steps,
         batch_size=args.batch_size,

@@ -37,6 +37,11 @@ SIGNAL_META_FEATURE_KEYS = tuple(DECISION_FEATURE_KEYS)
 SIGNAL_META_FEATURE_COUNT = DECISION_WINDOW_DIM
 SIGNAL_META_HORIZON_BARS = 24
 
+# Target normalization constants for auxiliary heads
+TARGET_PIP_SCALE = 100.0        # Scale pips, MFE, MAE by 100.0 so target range is ~[0.0 - 5.0]
+TARGET_ZONE_DIST_SCALE = 10.0   # Scale ATR zone distance by 10.0 so target range is ~[0.0 - 1.0]
+TARGET_ZONE_TYPE_SCALE = 2.0    # Scale zone type (0=none, 1=support, 2=resistance) by 2.0
+
 # Aliases for service/contract interfaces
 CANONICAL_FEATURE_NAMES = list(SIGNAL_META_FEATURE_KEYS)
 FEATURE_SCHEMA_VERSION = SIGNAL_META_FEATURE_CONTRACT_VERSION
@@ -124,38 +129,44 @@ class FeatureScaler:
 
 
 
+HORIZON_BARS = (1, 3, 6, 12)
+HORIZON_LABELS = ("5m", "15m", "30m", "1h")
+
+
 @dataclass
 class ForwardMoveStats:
-    """Statistics capturing price trajectory over a forward lookforward window (default 24 bars)."""
+    """Statistics capturing price trajectory across 4 multi-horizon lookforward windows (5m, 15m, 30m, 1h)."""
     signal_id: str
     symbol: str
     direction: str  # 'bullish' | 'bearish'
     entry_price: float
-    lookforward_bars: int = 24
-    mfe_pips: float = 0.0          # Max Favorable Excursion in pips
-    mae_pips: float = 0.0          # Max Adverse Excursion in pips
-    net_pips_24h: float = 0.0      # Net move at bar 24 in pips
+    lookforward_bars: int = 12
+    mfe_pips: float = 0.0          # Max Favorable Excursion in pips (1h)
+    mae_pips: float = 0.0          # Max Adverse Excursion in pips (1h)
+    net_pips_24h: float = 0.0      # Net move in pips (1h)
     next_zone_dist_atr: float = 0.0 # ATR-normalized distance to next SNR zone
     next_zone_type: float = 0.0     # 0.0=none, 1.0=support, 2.0=resistance
     reversal_prob: float = 0.0      # Decay-weighted reversal probability [0.0 - 1.0]
     reversal_bar: int = -1         # Bar index where reversal occurred (-1 if no reversal)
-    reward: float = 0.0            # Calculated RL reward score [-1.0, +1.0]
-    signal_strength: float = 0.5   # Normalized signal strength [0.0, 1.0]
+    reward: float = 0.0            # Calculated RL reward score [-1.0, +1.0] (1h)
+    signal_strength: float = 0.5   # Main normalized signal strength [0.0, 1.0]
+
+    # Multi-Horizon Targets & Predictions (5m, 15m, 30m, 1h)
+    horizon_strengths: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5, 0.5])
+    horizon_rewards: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0])
+    horizon_mfes: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0])
+    horizon_maes: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0])
+    optimal_horizon_idx: int = 2
+    recommended_expiry: str = "30m"
 
 
 class ForwardMoveRewardCalculator:
     """
-    Calculates forward move statistics and RL rewards over a 24-bar / 24-hour lookforward window.
-
-    Evaluates:
-    - MFE (Max Favorable Excursion): Highest favorable price movement in pips.
-    - MAE (Max Adverse Excursion): Highest drawdown before peak.
-    - Next Zone Distance & Type: Proximity to nearest structural SNR level.
-    - Reversal Probability: Drawdown frequency and depth.
-    - Reward: Normalized Sharpe-like ratio: (MFE - 1.5 * MAE) / ATR_pips.
+    Calculates multi-horizon forward move statistics and RL rewards over 4 expiry horizons:
+    H1=1 bar (5m), H2=3 bars (15m), H3=6 bars (30m), H4=12 bars (1h).
     """
 
-    def __init__(self, lookforward_bars: int = 24, pip_scale: Optional[float] = None, alpha_mae_penalty: float = 1.5):
+    def __init__(self, lookforward_bars: int = 12, pip_scale: Optional[float] = None, alpha_mae_penalty: float = 1.5):
         self.lookforward_bars = lookforward_bars
         self.pip_scale = pip_scale
         self.alpha_mae_penalty = alpha_mae_penalty
@@ -175,10 +186,10 @@ class ForwardMoveRewardCalculator:
         reversal_prob: Optional[float] = None,
     ) -> ForwardMoveStats:
         """
-        Compute forward move stats for a signal over up to 24 bars.
+        Compute multi-horizon forward move stats for a signal over [1, 3, 6, 12] bars.
         """
-        n = min(len(future_closes), self.lookforward_bars)
-        if n == 0 or entry_price <= 0:
+        n_total = len(future_closes)
+        if n_total == 0 or entry_price <= 0:
             return ForwardMoveStats(
                 signal_id=signal_id,
                 symbol=symbol,
@@ -187,37 +198,57 @@ class ForwardMoveRewardCalculator:
                 lookforward_bars=self.lookforward_bars,
             )
 
-        # Scale pips according to asset class (e.g. JPY/GOLD vs standard FX)
         scale = self.pip_scale or get_instrument_metadata(symbol).pip_scale
         atr = atr_pips if (atr_pips is not None and atr_pips > 0) else 10.0
-
         is_bullish = direction.lower() == 'bullish'
-        highs = future_highs[:n]
-        lows = future_lows[:n]
-        closes = future_closes[:n]
 
+        h_strengths, h_rewards, h_mfes, h_maes = [], [], [], []
+
+        for h in HORIZON_BARS:
+            n = min(n_total, h)
+            highs = future_highs[:n]
+            lows = future_lows[:n]
+            closes = future_closes[:n]
+
+            if is_bullish:
+                fav_diffs = (highs - entry_price) * scale
+                adv_diffs = (entry_price - lows) * scale
+            else:
+                fav_diffs = (entry_price - lows) * scale
+                adv_diffs = (highs - entry_price) * scale
+
+            mfe_h = float(np.max(fav_diffs)) if len(fav_diffs) > 0 else 0.0
+            mae_h = float(np.max(adv_diffs)) if len(adv_diffs) > 0 else 0.0
+
+            raw_reward = (mfe_h - self.alpha_mae_penalty * mae_h) / max(atr, 1.0)
+            reward_h = float(math.tanh(raw_reward / 3.0))
+            clipped = max(-60.0, min(60.0, raw_reward))
+            strength_h = float(1.0 / (1.0 + math.exp(-clipped)))
+
+            h_mfes.append(mfe_h)
+            h_maes.append(mae_h)
+            h_rewards.append(reward_h)
+            h_strengths.append(strength_h)
+
+        optimal_idx = int(np.argmax(h_strengths))
+        recommended_expiry = HORIZON_LABELS[optimal_idx]
+
+        # 1h overall calculations for legacy compatibility
+        n_1h = min(n_total, 12)
         if is_bullish:
-            fav_diffs = (highs - entry_price) * scale
-            adv_diffs = (entry_price - lows) * scale
-            net_diff = (closes[-1] - entry_price) * scale
+            net_24h = float((future_closes[n_1h - 1] - entry_price) * scale)
+            adv_diffs_1h = (entry_price - future_lows[:n_1h]) * scale
         else:
-            fav_diffs = (entry_price - lows) * scale
-            adv_diffs = (highs - entry_price) * scale
-            net_diff = (entry_price - closes[-1]) * scale
+            net_24h = float((entry_price - future_closes[n_1h - 1]) * scale)
+            adv_diffs_1h = (future_highs[:n_1h] - entry_price) * scale
 
-        mfe = float(np.max(fav_diffs)) if len(fav_diffs) > 0 else 0.0
-        mae = float(np.max(adv_diffs)) if len(adv_diffs) > 0 else 0.0
-        net_24h = float(net_diff)
-
-        # Find reversal bar: first bar where drawdown exceeded 50% of MFE or 1.5 * ATR
-        reversal_threshold = max(0.5 * mfe, 1.5 * atr)
-        reversal_indices = np.where(adv_diffs > reversal_threshold)[0]
+        reversal_threshold = max(0.5 * h_mfes[-1], 1.5 * atr)
+        reversal_indices = np.where(adv_diffs_1h > reversal_threshold)[0]
         reversal_bar = int(reversal_indices[0]) if len(reversal_indices) > 0 else -1
 
-        # Calculate decay-weighted reversal probability if not explicitly provided
         if reversal_prob is None:
-            weights = np.exp(-0.1 * np.arange(n))
-            rev_events = (adv_diffs > 1.0 * atr).astype(np.float32)
+            weights = np.exp(-0.1 * np.arange(n_1h))
+            rev_events = (adv_diffs_1h > 1.0 * atr).astype(np.float32)
             calculated_rev_prob = float(np.sum(rev_events * weights) / (np.sum(weights) + 1e-6))
             calculated_rev_prob = max(0.0, min(1.0, calculated_rev_prob))
         else:
@@ -226,31 +257,29 @@ class ForwardMoveRewardCalculator:
         zone_dist = float(next_zone_dist_atr) if next_zone_dist_atr is not None else 2.0
         zone_type = float(next_zone_type) if next_zone_type is not None else 0.0
 
-        # Calculate reward score normalized by ATR
-        raw_reward = (mfe - self.alpha_mae_penalty * mae) / max(atr, 1.0)
-        # Hyperbolic tangent squeeze to [-1.0, +1.0]
-        reward = float(math.tanh(raw_reward / 3.0))
-
-        # Signal strength mapping: sigmoid score from 0.0 to 1.0
-        clipped = max(-60.0, min(60.0, raw_reward))
-        signal_strength = float(1.0 / (1.0 + math.exp(-clipped)))
-
         return ForwardMoveStats(
             signal_id=signal_id,
             symbol=symbol,
             direction=direction,
             entry_price=entry_price,
-            lookforward_bars=n,
-            mfe_pips=mfe,
-            mae_pips=mae,
+            lookforward_bars=12,
+            mfe_pips=h_mfes[-1],
+            mae_pips=h_maes[-1],
             net_pips_24h=net_24h,
             next_zone_dist_atr=zone_dist,
             next_zone_type=zone_type,
             reversal_prob=calculated_rev_prob,
             reversal_bar=reversal_bar,
-            reward=reward,
-            signal_strength=signal_strength,
+            reward=h_rewards[-1],
+            signal_strength=h_strengths[optimal_idx],
+            horizon_strengths=h_strengths,
+            horizon_rewards=h_rewards,
+            horizon_mfes=h_mfes,
+            horizon_maes=h_maes,
+            optimal_horizon_idx=optimal_idx,
+            recommended_expiry=recommended_expiry,
         )
+
 
 
 class PrioritizedReplayBuffer:
@@ -457,23 +486,23 @@ class SignalMetaNetwork(nn.Module):
         self.b2_ln = nn.LayerNorm(128)
         self.b2_act = nn.SiLU()
 
-        # Auxiliary Supervised Heads per branch (predicting strength & reversal)
-        self.aux1_head = nn.Linear(128, 2)  # [strength_aux, reversal_aux]
-        self.aux2_head = nn.Linear(128, 2)  # [strength_aux, reversal_aux]
+        # Auxiliary Supervised Heads per branch (predicting 4-horizon strengths & reversal)
+        self.aux1_head = nn.Linear(128, 5)  # [strength_5m, strength_15m, strength_30m, strength_1h, reversal_aux]
+        self.aux2_head = nn.Linear(128, 5)  # [strength_5m, strength_15m, strength_30m, strength_1h, reversal_aux]
 
         # Gated Ensemble Fusion Head
-        # Inputs: b1_out (128) + b2_out (128) + aux1_sg (2) + aux2_sg (2) = 260
-        self.fusion_fc1 = nn.Linear(128 + 128 + 2 + 2, hidden_dim)
+        # Inputs: b1_out (128) + b2_out (128) + aux1_sg (5) + aux2_sg (5) = 266
+        self.fusion_fc1 = nn.Linear(128 + 128 + 5 + 5, hidden_dim)
         self.fusion_ln1 = nn.LayerNorm(hidden_dim)
         self.fusion_act1 = nn.SiLU()
 
         self.q_head = nn.Linear(hidden_dim, num_actions)
         self.strength_head = nn.Sequential(
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, 4),
             nn.Sigmoid(),
         )
-        self.pips_head = nn.Linear(hidden_dim, 1)
-        self.risk_head = nn.Linear(hidden_dim, 2)
+        self.pips_head = nn.Linear(hidden_dim, 4)
+        self.risk_head = nn.Linear(hidden_dim, 8)
         self.liquidity_head = nn.Linear(hidden_dim, 2)
         self.reversal_head = nn.Sequential(
             nn.Linear(hidden_dim, 1),
@@ -481,6 +510,7 @@ class SignalMetaNetwork(nn.Module):
         )
 
         self._c_dim = c_dim
+
 
     def forward(
         self, x: torch.Tensor, return_aux: bool = False
@@ -500,8 +530,8 @@ class SignalMetaNetwork(nn.Module):
         b2_out = self.b2_act(self.b2_ln(self.b2_fusion(b2_cat)))
 
         # ── Auxiliary Supervision & StopGradient Detaching ───────────────────
-        aux1 = self.aux1_head(b1_out)
-        aux2 = self.aux2_head(b2_out)
+        aux1 = self.aux1_head(b1_out.detach())
+        aux2 = self.aux2_head(b2_out.detach())
 
         aux1_sg = aux1.detach()
         aux2_sg = aux2.detach()
@@ -512,10 +542,13 @@ class SignalMetaNetwork(nn.Module):
 
         q_vals = self.q_head(feat)
         strength = self.strength_head(feat)
-        pips = self.pips_head(feat)
-        risk = self.risk_head(feat)
-        liquidity = self.liquidity_head(feat)
-        reversal = self.reversal_head(feat)
+
+        # ── Decoupled Auxiliary Heads (feat.detach stops gradient interference) ──
+        feat_aux = feat.detach()
+        pips = self.pips_head(feat_aux)
+        risk = self.risk_head(feat_aux)
+        liquidity = self.liquidity_head(feat_aux)
+        reversal = self.reversal_head(feat_aux)
 
         if return_aux:
             return q_vals, strength, pips, risk, liquidity, reversal, aux1, aux2
@@ -628,16 +661,24 @@ class OnlineSignalMetaLearner:
 
         action_idx = 0 if direction.lower() == 'bullish' else 1
         q_val = float(q_vals[0, action_idx].item())
-        strength = float(strength_tensor[0, 0].item())
-        expected_pips = float(pips_tensor[0, 0].item())
-        pred_mfe = float(risk_tensor[0, 0].item())
-        pred_mae = float(risk_tensor[0, 1].item())
-        pred_zone_dist = float(liquidity_tensor[0, 0].item())
-        pred_zone_type = float(liquidity_tensor[0, 1].item())
+
+        h_strengths = [float(strength_tensor[0, i].item()) for i in range(4)]
+        opt_idx = int(np.argmax(h_strengths))
+        rec_expiry = HORIZON_LABELS[opt_idx]
+        strength = float(h_strengths[opt_idx])
+
+        expected_pips = float(pips_tensor[0, opt_idx].item()) * TARGET_PIP_SCALE
+        pred_mfe = float(risk_tensor[0, opt_idx * 2].item()) * TARGET_PIP_SCALE
+        pred_mae = float(risk_tensor[0, opt_idx * 2 + 1].item()) * TARGET_PIP_SCALE
+        pred_zone_dist = float(liquidity_tensor[0, 0].item()) * TARGET_ZONE_DIST_SCALE
+        pred_zone_type = float(liquidity_tensor[0, 1].item()) * TARGET_ZONE_TYPE_SCALE
         pred_reversal_prob = float(reversal_tensor[0, 0].item())
 
         return {
             'signal_strength': round(strength, 4),
+            'horizon_strengths': [round(s, 4) for s in h_strengths],
+            'optimal_horizon_idx': opt_idx,
+            'recommended_expiry': rec_expiry,
             'expected_pips': round(expected_pips, 2),
             'expected_mfe_pips': round(pred_mfe, 2),
             'expected_mae_pips': round(pred_mae, 2),
@@ -665,7 +706,7 @@ class OnlineSignalMetaLearner:
         reversal_prob: Optional[float] = None,
     ) -> ForwardMoveStats:
         """
-        Record a 24-bar outcome transition into the prioritized experience replay queue.
+        Record a multi-horizon transition into the prioritized experience replay queue.
         """
         state = self.extract_features(feature_dict)
         next_state = self.extract_features(next_feature_dict) if next_feature_dict is not None else state
@@ -737,39 +778,47 @@ class OnlineSignalMetaLearner:
         loss_q = torch.mean(weights_t * (td_error ** 2))
 
         # Reward-to-strength target
-        target_strength = torch.clamp((rewards + 1.0) / 2.0, 0.0, 1.0)
-        loss_strength = torch.mean((strength_pred.squeeze(1) - target_strength) ** 2)
+        target_strength = torch.clamp((rewards.unsqueeze(1) + 1.0) / 2.0, 0.0, 1.0)
+        loss_strength = torch.mean((strength_pred[:, :1] - target_strength) ** 2)
+
+        # Scale pips & risk targets by TARGET_PIP_SCALE (100.0) so raw loss is ~0.01 - 0.5
+        scaled_target_pips = target_pips / TARGET_PIP_SCALE
         loss_pips = torch.mean(weights_t * nn.functional.smooth_l1_loss(
-            pips_pred.squeeze(1), target_pips, reduction='none',
+            pips_pred[:, :1].squeeze(1), scaled_target_pips, reduction='none',
         ))
 
-        # Auxiliary Head Losses
-        target_risk = torch.stack([mfe_pips, mae_pips], dim=1)
+        # Auxiliary Head Losses (MFE/MAE scaled by TARGET_PIP_SCALE)
+        target_risk = torch.stack([mfe_pips / TARGET_PIP_SCALE, mae_pips / TARGET_PIP_SCALE], dim=1)
         loss_risk = torch.mean(weights_t * nn.functional.smooth_l1_loss(
-            risk_pred, target_risk, reduction='none'
-        ).sum(dim=1))
+            risk_pred[:, :2], target_risk, reduction='none'
+        ).mean(dim=1))
 
-        target_liquidity = torch.stack([next_zone_dist_atr, next_zone_type], dim=1)
+        # Liquidity targets: distance normalized by 10.0, type by 2.0
+        target_liquidity = torch.stack([
+            next_zone_dist_atr / TARGET_ZONE_DIST_SCALE,
+            next_zone_type / TARGET_ZONE_TYPE_SCALE
+        ], dim=1)
         loss_liquidity = torch.mean(weights_t * nn.functional.smooth_l1_loss(
             liquidity_pred, target_liquidity, reduction='none'
-        ).sum(dim=1))
+        ).mean(dim=1))
 
         loss_reversal = torch.mean(weights_t * ((reversal_pred.squeeze(1) - reversal_prob) ** 2))
 
         # Branch-specific auxiliary supervision losses (aux1: Dense branch, aux2: Multi-Scale branch)
-        target_aux = torch.stack([target_strength, reversal_prob], dim=1)
-        loss_aux1 = torch.mean(weights_t * nn.functional.smooth_l1_loss(aux1, target_aux, reduction='none').sum(dim=1))
-        loss_aux2 = torch.mean(weights_t * nn.functional.smooth_l1_loss(aux2, target_aux, reduction='none').sum(dim=1))
+        target_aux = torch.cat([target_strength.repeat(1, 4), reversal_prob.unsqueeze(1)], dim=1)
+        loss_aux1 = torch.mean(weights_t * nn.functional.smooth_l1_loss(aux1, target_aux, reduction='none').mean(dim=1))
+        loss_aux2 = torch.mean(weights_t * nn.functional.smooth_l1_loss(aux2, target_aux, reduction='none').mean(dim=1))
 
+        # Balanced Total Loss: Core Q & Strength heads dominate, auxiliary heads contribute ~0.05-0.1 each
         total_loss = (
             loss_q
             + loss_strength
-            + loss_pips
+            + 0.1 * loss_pips
             + 0.1 * loss_risk
             + 0.1 * loss_liquidity
             + 0.1 * loss_reversal
-            + 0.2 * loss_aux1
-            + 0.2 * loss_aux2
+            + 0.1 * loss_aux1
+            + 0.1 * loss_aux2
         )
 
         self.optimizer.zero_grad()
@@ -777,7 +826,6 @@ class OnlineSignalMetaLearner:
         nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
         self.optimizer.step()
         self.total_steps += 1
-
 
         # Update priorities in replay buffer based on TD errors
         new_prios = np.abs(td_error.detach().cpu().numpy()) + 1e-4
@@ -791,8 +839,11 @@ class OnlineSignalMetaLearner:
             'loss_risk': float(loss_risk.item()),
             'loss_liquidity': float(loss_liquidity.item()),
             'loss_reversal': float(loss_reversal.item()),
+            'loss_aux1': float(loss_aux1.item()),
+            'loss_aux2': float(loss_aux2.item()),
             'buffer_size': len(self.replay_buffer),
         }
+
 
     def sync_target_network(self):
         """Soft/hard sync of target network weights."""

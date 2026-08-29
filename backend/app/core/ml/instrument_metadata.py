@@ -16,12 +16,16 @@ DEFAULT_INSTRUMENT = InstrumentMetadata(symbol="DEFAULT", pip_size=0.0001, price
 
 
 def get_instrument_metadata(symbol: str) -> InstrumentMetadata:
-    normalized = symbol.upper().replace("/", "")
+    normalized = symbol.upper().replace("/", "").replace("-", "")
     if "JPY" in normalized:
         return InstrumentMetadata(symbol=symbol, pip_size=0.01, price_decimals=3)
-    if normalized.startswith(("XAU", "GOLD")):
+    if "GLD" in normalized or "XAU" in normalized or "GOLD" in normalized:
         return InstrumentMetadata(symbol=symbol, pip_size=0.01, price_decimals=2)
-    if normalized.startswith(("US30", "NAS", "SPX", "GER", "UK100")):
+    if "BTC" in normalized:
+        return InstrumentMetadata(symbol=symbol, pip_size=1.0, price_decimals=2)
+    if "ETH" in normalized:
+        return InstrumentMetadata(symbol=symbol, pip_size=0.1, price_decimals=2)
+    if any(k in normalized for k in ("US30", "NAS", "SPX", "GER", "UK100", "NDX")):
         return InstrumentMetadata(symbol=symbol, pip_size=0.1, price_decimals=1)
     return InstrumentMetadata(
         symbol=symbol,

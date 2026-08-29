@@ -184,8 +184,8 @@ def test_time_and_session_features_encoding(zone_manager):
     s_power = executor.build_state_vector(htf_bias, account, ctx_power, zone_manager)
 
     # Check sin/cos hour and session flags
-    assert s_open[22] == 1.0  # is_nyse_open
-    assert s_open[23] == 0.0  # is_power_hour
-    assert s_power[22] == 0.0
-    assert s_power[23] == 1.0  # is_power_hour
+    assert s_open[26] == 1.0  # is_nyse_open
+    assert s_open[27] == 0.0  # is_power_hour
+    assert s_power[26] == 0.0
+    assert s_power[27] == 1.0  # is_power_hour
 
