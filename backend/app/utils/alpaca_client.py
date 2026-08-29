@@ -22,7 +22,8 @@ class AlpacaClient:
         self.base_url = ALPACA_BASE_URL
         self.session = requests.Session()
         self.session.headers.update({
-            "APCA-API-KEY-ID": self.api_key,
+            "APCA-API-KEY-ID": self.api_key or "",
+            "APCA-API-SECRET-KEY": self.secret_key or "",
         })
 
     def get_account(self) -> Optional[Dict]:
@@ -88,6 +89,50 @@ class AlpacaClient:
             logger.error(f"Failed to fetch bars for {symbol}: {e}")
             return []
 
+    def place_option_order(
+        self,
+        symbol: str,
+        qty: int,
+        side: str,
+        type: str = "market",
+        time_in_force: str = "day"
+    ) -> Optional[Dict]:
+        """Place an option order on Alpaca API (using asset_class='option')."""
+        try:
+            payload = {
+                "symbol": symbol,
+                "qty": str(qty),
+                "side": side,
+                "type": type,
+                "time_in_force": time_in_force,
+                "asset_class": "option",
+            }
+            response = self.session.post(f"{self.base_url}/v2/orders", json=payload)
+            response.raise_for_status()
+            logger.info(f"Option order placed: {symbol} {qty} {side}")
+            return response.json()
+        except Exception as e:
+            logger.error(f"Failed to place option order for {symbol}: {e}")
+            return None
+
+    def get_option_contracts(self, underlying_symbol: str, expiration_date_gte: Optional[str] = None) -> List[Dict]:
+        """Fetch option contracts for an underlying ticker."""
+        try:
+            params = {
+                "underlying_symbols": underlying_symbol,
+                "status": "active",
+            }
+            if expiration_date_gte:
+                params["expiration_date_gte"] = expiration_date_gte
+
+            response = self.session.get(f"{self.base_url}/v2/options/contracts", params=params)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("option_contracts", []) if isinstance(data, dict) else data
+        except Exception as e:
+            logger.error(f"Failed to fetch option contracts for {underlying_symbol}: {e}")
+            return []
+
     def is_market_open(self) -> bool:
         """Check if market is currently open."""
         try:
@@ -98,3 +143,4 @@ class AlpacaClient:
         except Exception as e:
             logger.error(f"Failed to check market status: {e}")
             return False
+
