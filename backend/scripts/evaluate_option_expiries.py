@@ -186,9 +186,9 @@ def compute_full_context_features(aligned_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000):
+def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framework: str = "keras"):
     print(f"\n==================================================================================")
-    print(f"      EVALUATING OPTION EXPIRY HORIZONS FOR SYMBOL: {symbol} (5m Execution)")
+    print(f"      EVALUATING OPTION EXPIRY HORIZONS FOR SYMBOL: {symbol} (5m Execution | Framework: {framework.upper()})")
     print(f"==================================================================================")
 
     # 1. Fetch & Align real market data with expanded dataset
@@ -256,8 +256,15 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000):
     print()
 
     # 2. Train Two-Tier Ensemble Learners once on Train Set
-    meta_learner = OnlineSignalMetaLearner(input_dim=SIGNAL_META_FEATURE_COUNT, replay_capacity=20000)
-    q_executor = OptionsQExecutor(device="cpu")
+    if framework == "keras":
+        from app.core.ml.keras_signal_meta_learner import KerasOnlineSignalMetaLearner
+        from app.core.options.keras_q_executor import KerasOptionsQExecutor
+        meta_learner = KerasOnlineSignalMetaLearner(num_features=238, lookback_bars=48, replay_capacity=20000)
+        q_executor = KerasOptionsQExecutor()
+    else:
+        meta_learner = OnlineSignalMetaLearner(input_dim=SIGNAL_META_FEATURE_COUNT, replay_capacity=20000)
+        q_executor = OptionsQExecutor(device="cpu")
+
     zone_manager = ZoneSnapshotManager(max_snapshots=20)
     account = AccountContext()
 
@@ -749,7 +756,8 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Evaluate Option Expiries Benchmark")
     parser.add_argument("--limit", type=int, default=40000, help="Candle limit per timeframe")
+    parser.add_argument("--framework", type=str, choices=["keras", "pytorch"], default="keras", help="Model framework (keras or pytorch)")
     args = parser.parse_args()
 
-    evaluate_expiries_for_symbol("GLD", limit=args.limit)
-    evaluate_expiries_for_symbol("BTC/USD", limit=args.limit)
+    evaluate_expiries_for_symbol("GLD", limit=args.limit, framework=args.framework)
+    evaluate_expiries_for_symbol("BTC/USD", limit=args.limit, framework=args.framework)
