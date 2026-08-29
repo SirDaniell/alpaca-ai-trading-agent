@@ -79,20 +79,84 @@ class ExecutionContext:
 
 
 class ExecutorQNetwork(nn.Module):
-    """Deep Q-Network for LTF Options Execution."""
+    """
+    Two-Branch Ensemble Deep Q-Network for LTF Options Execution.
+    Mirrors build_classification_ensemble_model (tt.py) architecture:
+    - Branch 1 (Dense Feature Tower): Deep representation over all 24 state features with LayerNorm & SiLU.
+    - Branch 2 (Multi-Scale Grouped Tower): Grouped projections over Meta-Learner (0..5), Risk (6..10), Zone (11..18), and Time (19..23) features.
+    - Supervised Aux Heads (aux1_head, aux2_head): Independent aux predictions per branch before fusion.
+    - StopGradient Isolation: aux1 & aux2 predictions are detached before feeding into Gated Fusion Layer.
+    - Gated Fusion Head: Combines b1_out, b2_out, aux1_detached, aux2_detached for robust Q-value estimation.
+    """
 
     def __init__(self, input_dim: int = EXECUTOR_STATE_DIM, hidden_dim: int = 128, num_actions: int = NUM_ACTIONS):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, num_actions),
-        )
+        # Branch 1: Dense Feature Extraction Tower
+        self.b1_fc1 = nn.Linear(input_dim, hidden_dim)
+        self.b1_ln1 = nn.LayerNorm(hidden_dim)
+        self.b1_act1 = nn.SiLU()
+        self.b1_drop = nn.Dropout(0.2)
+        self.b1_fc2 = nn.Linear(hidden_dim, 64)
+        self.b1_ln2 = nn.LayerNorm(64)
+        self.b1_act2 = nn.SiLU()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        # Branch 2: Multi-Scale Grouped Feature Tower
+        # Slice inputs into 4 semantic sub-groups: Meta (6), Risk (5), Zone (8), Time (5)
+        self.b2_meta = nn.Linear(6, 32)
+        self.b2_risk = nn.Linear(5, 32)
+        self.b2_zone = nn.Linear(8, 32)
+        self.b2_time = nn.Linear(5, 32)
+        self.b2_fusion = nn.Linear(128, 64)
+        self.b2_ln = nn.LayerNorm(64)
+        self.b2_act = nn.SiLU()
+
+        # Auxiliary Supervised Heads (1 per branch)
+        self.aux1_head = nn.Linear(64, num_actions)
+        self.aux2_head = nn.Linear(64, num_actions)
+
+        # Gated Ensemble Fusion Head
+        # Inputs: b1_out (64) + b2_out (64) + aux1_detached (5) + aux2_detached (5) = 138
+        self.fusion_fc1 = nn.Linear(64 + 64 + num_actions + num_actions, hidden_dim)
+        self.fusion_ln1 = nn.LayerNorm(hidden_dim)
+        self.fusion_act1 = nn.SiLU()
+        self.fusion_out = nn.Linear(hidden_dim, num_actions)
+
+    def forward(self, x: torch.Tensor, return_aux: bool = False) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # ── Branch 1 ────────────────────────────────────────────────────────
+        b1 = self.b1_act1(self.b1_ln1(self.b1_fc1(x)))
+        b1 = self.b1_drop(b1)
+        b1_out = self.b1_act2(self.b1_ln2(self.b1_fc2(b1)))
+
+        # ── Branch 2 ────────────────────────────────────────────────────────
+        meta_feats = x[:, :6]
+        risk_feats = x[:, 6:11]
+        zone_feats = x[:, 11:19]
+        time_feats = x[:, 19:24]
+
+        b2_m = torch.relu(self.b2_meta(meta_feats))
+        b2_r = torch.relu(self.b2_risk(risk_feats))
+        b2_z = torch.relu(self.b2_zone(zone_feats))
+        b2_t = torch.relu(self.b2_time(time_feats))
+        b2_cat = torch.cat([b2_m, b2_r, b2_z, b2_t], dim=-1)
+        b2_out = self.b2_act(self.b2_ln(self.b2_fusion(b2_cat)))
+
+        # ── Independent Auxiliary Heads ─────────────────────────────────────
+        aux1_q = self.aux1_head(b1_out)
+        aux2_q = self.aux2_head(b2_out)
+
+        # ── StopGradient Isolation ──────────────────────────────────────────
+        aux1_sg = aux1_q.detach()
+        aux2_sg = aux2_q.detach()
+
+        # ── Gated Fusion Layer ───────────────────────────────────────────────
+        fusion_in = torch.cat([b1_out, b2_out, aux1_sg, aux2_sg], dim=-1)
+        fused = self.fusion_act1(self.fusion_ln1(self.fusion_fc1(fusion_in)))
+        q_final = self.fusion_out(fused)
+
+        if return_aux:
+            return q_final, aux1_q, aux2_q
+        return q_final
+
 
 
 class OptionsQExecutor:
@@ -253,8 +317,11 @@ class OptionsQExecutor:
         t_dones = torch.tensor(dones, dtype=torch.float32, device=self.device).unsqueeze(1)
         t_next_masks = torch.tensor(np.array(next_masks), dtype=torch.float32, device=self.device)
 
-        # Current Q-values
-        q_eval = self.policy_net(t_states).gather(1, t_actions)
+        # Current Q-values with auxiliary outputs
+        q_eval, aux1_eval, aux2_eval = self.policy_net(t_states, return_aux=True)
+        q_eval_sel = q_eval.gather(1, t_actions)
+        aux1_sel = aux1_eval.gather(1, t_actions)
+        aux2_sel = aux2_eval.gather(1, t_actions)
 
         # Double Q-Learning target calculation with Action Masking
         with torch.no_grad():
@@ -266,16 +333,22 @@ class OptionsQExecutor:
             next_q_target = self.target_net(t_next_states).gather(1, best_next_actions)
             q_target = t_rewards + (1.0 - t_dones) * self.gamma * next_q_target
 
-        loss = nn.SmoothL1Loss()(q_eval, q_target)
+        smooth_l1 = nn.SmoothL1Loss()
+        main_loss = smooth_l1(q_eval_sel, q_target)
+        aux1_loss = smooth_l1(aux1_sel, q_target)
+        aux2_loss = smooth_l1(aux2_sel, q_target)
+
+        total_loss = main_loss + 0.2 * aux1_loss + 0.2 * aux2_loss
 
         self.optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
         self.optimizer.step()
 
         # Decay epsilon
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-        return float(loss.item())
+        return float(total_loss.item())
+
 
     def update_target_network(self) -> None:
         """Sync target network weights."""

@@ -71,23 +71,106 @@ class AlpacaClient:
             logger.error(f"Failed to place order: {e}")
             return None
 
-    def get_bars(self, symbol: str, timeframe: str = "1min", limit: int = 500) -> List[Dict]:
-        """Get historical bars for a symbol."""
+    def get_bars(
+        self,
+        symbol: str,
+        timeframe: str = "5Min",
+        limit: int = 500,
+        start: Optional[str] = None,
+    ) -> List[Dict]:
+        """Get historical bars for a stock/ETF or Crypto symbol using Alpaca Data API.
+
+        Paginates automatically until `limit` bars are collected or the API
+        has no more data.  For stocks the Alpaca v2 data endpoint requires a
+        `start` date to return intraday bars; if one is not supplied we default
+        to 90 days ago so the call always returns real data.
+
+        Args:
+            symbol:    Ticker string.  Crypto uses the slash form, e.g. "BTC/USD".
+            timeframe: Alpaca timeframe string or short alias (5m, 15m, 1h, 4h, 1d).
+            limit:     Maximum number of bars to return across all pages.
+            start:     ISO-8601 UTC start datetime string, e.g. "2026-01-01T00:00:00Z".
+                       Defaults to 90 days ago for stocks, 7 days ago for crypto.
+        """
+        import datetime as _dt
+        data_base_url = "https://data.alpaca.markets"
+        tf_map = {"5m": "5Min", "15m": "15Min", "1h": "1Hour", "4h": "4Hour", "1d": "1Day"}
+        norm_tf = tf_map.get(timeframe.lower(), timeframe)
+
+        is_crypto = "/" in symbol or symbol.upper().startswith("BTC")
+
+        # Determine default look-back window (scaled proportionally with limit)
+        if start is None:
+            if is_crypto:
+                default_days = max(7, int(limit / 288) + 1)
+            else:
+                # 5m bars: ~78 bars per day for equities. Scale start window up to 2+ years for 30k limit
+                default_days = max(90, int(limit / 50) + 1)
+            start = (
+                _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=default_days)
+            ).strftime("%Y-%m-%dT00:00:00Z")
+
+
+        all_bars: List[Dict] = []
+        page_size = min(limit, 1000)      # Alpaca max per page
+
         try:
-            params = {
-                "timeframe": timeframe,
-                "limit": limit,
-            }
-            response = self.session.get(
-                f"{self.base_url}/v2/stocks/{symbol}/bars",
-                params=params
-            )
-            response.raise_for_status()
-            data = response.json()
-            return data.get("bars", []) if isinstance(data, dict) else data
+            if is_crypto:
+                url = f"{data_base_url}/v1beta3/crypto/us/bars"
+                next_token: Optional[str] = None
+                while len(all_bars) < limit:
+                    params: Dict = {
+                        "symbols": symbol,
+                        "timeframe": norm_tf,
+                        "limit": min(page_size, limit - len(all_bars)),
+                        "start": start,
+                    }
+                    if next_token:
+                        params["page_token"] = next_token
+
+                    resp = self.session.get(url, params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    page_bars = (data.get("bars") or {}).get(symbol, []) or []
+                    all_bars.extend(page_bars)
+
+                    next_token = data.get("next_page_token")
+                    if not next_token or not page_bars:
+                        break
+
+            else:
+                # Equity / ETF
+                url = f"{data_base_url}/v2/stocks/{symbol}/bars"
+                next_token = None
+                while len(all_bars) < limit:
+                    params = {
+                        "timeframe": norm_tf,
+                        "limit": min(page_size, limit - len(all_bars)),
+                        "feed": "iex",
+                        "start": start,
+                    }
+                    if next_token:
+                        params["page_token"] = next_token
+
+                    resp = self.session.get(url, params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    page_bars = data.get("bars") or []
+                    all_bars.extend(page_bars)
+
+                    next_token = data.get("next_page_token")
+                    if not next_token or not page_bars:
+                        break
+
         except Exception as e:
             logger.error(f"Failed to fetch bars for {symbol}: {e}")
-            return []
+
+        logger.info(
+            "[AlpacaClient] Fetched %d bars for %s (%s, start=%s)",
+            len(all_bars), symbol, norm_tf, start,
+        )
+        return all_bars[:limit]
+
 
     def place_option_order(
         self,

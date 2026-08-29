@@ -228,12 +228,19 @@ class HardActionMask:
     ) -> np.ndarray:
         """
         Return binary mask array of shape (5,) where 1 = allowed, 0 = masked.
+        Strict Single Trade Rule:
+        - If has_open_position is True: New entries (BUY_CALL, BUY_PUT) are strictly MASKED OUT (0).
+          Only position management actions (TAKE_PROFIT_HALF, CLOSE_FLATTEN, WAIT) are permitted.
+        - If has_open_position is False: Position management actions (TAKE_PROFIT_HALF, CLOSE_FLATTEN) are MASKED OUT (0).
+          New entries (BUY_CALL, BUY_PUT) are evaluated based on zone proximity and volume delta.
         """
         mask = np.array([1, 0, 0, 0, 0], dtype=np.int32)  # WAIT always allowed
 
         if has_open_position:
             mask[3] = 1  # TAKE_PROFIT_HALF
             mask[4] = 1  # CLOSE_FLATTEN
+            # Single Running Trade Restriction: Cannot take new entries while a trade is active
+            return mask
 
         nearest_supp, nearest_res = zone_manager.get_nearest_zones(current_price)
         prox_dist = max(atr * self.proximity_atr_mult, current_price * 0.003)
@@ -261,3 +268,4 @@ class HardActionMask:
                     mask[2] = 1
 
         return mask
+

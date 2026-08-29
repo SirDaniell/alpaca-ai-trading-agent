@@ -423,26 +423,50 @@ def _hidden_dim_for(input_dim: int) -> int:
 
 class SignalMetaNetwork(nn.Module):
     """
-    Multi-Head Deep PyTorch Network predicting:
-    1. q_head: Contextual Q-values for action choices
-    2. strength_head: Signal quality score [0.0 - 1.0]
-    3. pips_head: Expected 24-bar net pips
-    4. risk_head: [pred_mfe_pips, pred_mae_pips]
-    5. liquidity_head: [pred_next_zone_dist_atr, pred_next_zone_type]
-    6. reversal_head: [pred_reversal_prob]
+    Two-Branch Ensemble Deep PyTorch Network for Signal Meta-Learning.
+    Mirrors tt.py ensemble architecture:
+    - Branch 1 (Dense TI Tower): Deep feature extraction over full input vector with LayerNorm & SiLU.
+    - Branch 2 (Multi-Scale Grouped Tower): Grouped projections over semantic TI sub-groups (MAs/RSI, Volatility, SMC, Context).
+    - Per-Branch Auxiliary Heads (aux1, aux2): Independent prediction heads per branch.
+    - StopGradient Isolation: aux predictions are detached before feeding into Gated Ensemble Fusion Head.
+    - Gated Ensemble Fusion Head: Combines b1_out, b2_out, aux1_sg, aux2_sg for multi-head signal predictions.
     """
 
-    def __init__(self, input_dim: int = 16, num_actions: int = 4, hidden_dim: int = 64):
+    def __init__(self, input_dim: int = DECISION_WINDOW_DIM, num_actions: int = 4, hidden_dim: int = 256):
         super().__init__()
         hidden_dim = hidden_dim or _hidden_dim_for(input_dim)
-        self.feature_net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-        )
+
+        # Branch 1: Dense Feature Extraction Tower
+        self.b1_fc1 = nn.Linear(input_dim, hidden_dim)
+        self.b1_ln1 = nn.LayerNorm(hidden_dim)
+        self.b1_act1 = nn.SiLU()
+        self.b1_drop = nn.Dropout(0.2)
+        self.b1_fc2 = nn.Linear(hidden_dim, 128)
+        self.b1_ln2 = nn.LayerNorm(128)
+        self.b1_act2 = nn.SiLU()
+
+        # Branch 2: Multi-Scale Grouped Feature Tower
+        # Divide input vector into 4 equal semantic chunks
+        c_dim = max(1, input_dim // 4)
+        rem = input_dim - (c_dim * 3)
+        self.b2_c1 = nn.Linear(c_dim, 64)
+        self.b2_c2 = nn.Linear(c_dim, 64)
+        self.b2_c3 = nn.Linear(c_dim, 64)
+        self.b2_c4 = nn.Linear(rem, 64)
+        self.b2_fusion = nn.Linear(256, 128)
+        self.b2_ln = nn.LayerNorm(128)
+        self.b2_act = nn.SiLU()
+
+        # Auxiliary Supervised Heads per branch (predicting strength & reversal)
+        self.aux1_head = nn.Linear(128, 2)  # [strength_aux, reversal_aux]
+        self.aux2_head = nn.Linear(128, 2)  # [strength_aux, reversal_aux]
+
+        # Gated Ensemble Fusion Head
+        # Inputs: b1_out (128) + b2_out (128) + aux1_sg (2) + aux2_sg (2) = 260
+        self.fusion_fc1 = nn.Linear(128 + 128 + 2 + 2, hidden_dim)
+        self.fusion_ln1 = nn.LayerNorm(hidden_dim)
+        self.fusion_act1 = nn.SiLU()
+
         self.q_head = nn.Linear(hidden_dim, num_actions)
         self.strength_head = nn.Sequential(
             nn.Linear(hidden_dim, 1),
@@ -456,17 +480,47 @@ class SignalMetaNetwork(nn.Module):
             nn.Sigmoid(),
         )
 
+        self._c_dim = c_dim
+
     def forward(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        feat = self.feature_net(x)
+        self, x: torch.Tensor, return_aux: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[Any, ...]:
+        # ── Branch 1 ────────────────────────────────────────────────────────
+        b1 = self.b1_act1(self.b1_ln1(self.b1_fc1(x)))
+        b1 = self.b1_drop(b1)
+        b1_out = self.b1_act2(self.b1_ln2(self.b1_fc2(b1)))
+
+        # ── Branch 2 ────────────────────────────────────────────────────────
+        c = self._c_dim
+        g1 = torch.relu(self.b2_c1(x[:, :c]))
+        g2 = torch.relu(self.b2_c2(x[:, c:2*c]))
+        g3 = torch.relu(self.b2_c3(x[:, 2*c:3*c]))
+        g4 = torch.relu(self.b2_c4(x[:, 3*c:]))
+        b2_cat = torch.cat([g1, g2, g3, g4], dim=-1)
+        b2_out = self.b2_act(self.b2_ln(self.b2_fusion(b2_cat)))
+
+        # ── Auxiliary Supervision & StopGradient Detaching ───────────────────
+        aux1 = self.aux1_head(b1_out)
+        aux2 = self.aux2_head(b2_out)
+
+        aux1_sg = aux1.detach()
+        aux2_sg = aux2.detach()
+
+        # ── Gated Fusion Layer ───────────────────────────────────────────────
+        fusion_in = torch.cat([b1_out, b2_out, aux1_sg, aux2_sg], dim=-1)
+        feat = self.fusion_act1(self.fusion_ln1(self.fusion_fc1(fusion_in)))
+
         q_vals = self.q_head(feat)
         strength = self.strength_head(feat)
         pips = self.pips_head(feat)
         risk = self.risk_head(feat)
         liquidity = self.liquidity_head(feat)
         reversal = self.reversal_head(feat)
+
+        if return_aux:
+            return q_vals, strength, pips, risk, liquidity, reversal, aux1, aux2
         return q_vals, strength, pips, risk, liquidity, reversal
+
 
 
 class OnlineSignalMetaLearner:
@@ -672,7 +726,7 @@ class OnlineSignalMetaLearner:
         reversal_prob = batch['reversal_prob']
         weights_t = torch.tensor(weights, dtype=torch.float32)
 
-        q_vals, strength_pred, pips_pred, risk_pred, liquidity_pred, reversal_pred = self.net(states)
+        q_vals, strength_pred, pips_pred, risk_pred, liquidity_pred, reversal_pred, aux1, aux2 = self.net(states, return_aux=True)
         with torch.no_grad():
             next_q_vals, _, _, _, _, _ = self.target_net(next_states)
             max_next_q, _ = torch.max(next_q_vals, dim=1)
@@ -702,13 +756,28 @@ class OnlineSignalMetaLearner:
 
         loss_reversal = torch.mean(weights_t * ((reversal_pred.squeeze(1) - reversal_prob) ** 2))
 
-        total_loss = loss_q + loss_strength + loss_pips + 0.1 * loss_risk + 0.1 * loss_liquidity + 0.1 * loss_reversal
+        # Branch-specific auxiliary supervision losses (aux1: Dense branch, aux2: Multi-Scale branch)
+        target_aux = torch.stack([target_strength, reversal_prob], dim=1)
+        loss_aux1 = torch.mean(weights_t * nn.functional.smooth_l1_loss(aux1, target_aux, reduction='none').sum(dim=1))
+        loss_aux2 = torch.mean(weights_t * nn.functional.smooth_l1_loss(aux2, target_aux, reduction='none').sum(dim=1))
+
+        total_loss = (
+            loss_q
+            + loss_strength
+            + loss_pips
+            + 0.1 * loss_risk
+            + 0.1 * loss_liquidity
+            + 0.1 * loss_reversal
+            + 0.2 * loss_aux1
+            + 0.2 * loss_aux2
+        )
 
         self.optimizer.zero_grad()
         total_loss.backward()
         nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
         self.optimizer.step()
         self.total_steps += 1
+
 
         # Update priorities in replay buffer based on TD errors
         new_prios = np.abs(td_error.detach().cpu().numpy()) + 1e-4
