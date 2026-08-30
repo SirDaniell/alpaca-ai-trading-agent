@@ -37,13 +37,21 @@ def _make_exec_ctx(symbol: str, price: float, row: dict) -> ExecutionContext:
     else:
         hour_f, dow = 14.5, 1
     phase = "nyse_open" if 13 <= getattr(ts, "hour", 14) < 17 else "off_hours"
-    vol = float(row.get("volume_5m", row.get("volume", 1000.0)))
+    vol = float(row.get("volume", row.get("volume_5m", 1000.0)))
+    c_price = float(row.get("close", price))
+    o_price = float(row.get("open", price))
+    if c_price >= o_price:
+        buy_vol = vol
+        sell_vol = 0.0
+    else:
+        buy_vol = 0.0
+        sell_vol = vol
     return ExecutionContext(
         symbol=symbol,
         current_price=price,
-        atr=float(row.get("atr_5m", price * 0.005)),
-        buy_volume=vol,
-        sell_volume=vol * 0.85,
+        atr=float(row.get("atr_5m", float(row.get("atr", price * 0.005)))),
+        buy_volume=buy_vol,
+        sell_volume=sell_vol,
         hour_of_day=hour_f,
         day_of_week=dow,
         session_phase=phase,
@@ -287,22 +295,56 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
     zone_manager = ZoneSnapshotManager(max_snapshots=20)
     account = AccountContext()
 
-    def _update_dynamic_zones(df_slice: pd.DataFrame):
-        if len(df_slice) < 20:
+    from app.core.analysis.support_resistance import (
+        detect_snr_levels_sequential,
+        create_clustered_zones_sequential,
+    )
+
+    def update_real_snr_snapshot(
+        df_full: pd.DataFrame,
+        up_to_idx: int,
+        zm: ZoneSnapshotManager,
+        timeframe: str = "15m",
+        lookback_period: int = 500,
+    ):
+        """
+        CRITICAL (NO LOOKAHEAD LEAKAGE):
+        Detect real S&R levels and volume profiles using ONLY historical price data up to `up_to_idx`.
+        """
+        if up_to_idx < 20:
             return
-        recent = df_slice.tail(1000)
-        supp_level = float(recent[low_col].quantile(0.20))
-        res_level = float(recent[high_col].quantile(0.80))
 
-        mid_level = (supp_level + res_level) / 2.0
-        raw_z = [
-            (1, supp_level, [(0, supp_level, "support")], {"upper_bound": supp_level * 1.004, "lower_bound": supp_level * 0.996, "total_volume": 50000.0, "net_volume": 10000.0}),
-            (2, res_level, [(0, res_level, "resistance")], {"upper_bound": res_level * 1.004, "lower_bound": res_level * 0.996, "total_volume": 60000.0, "net_volume": -12000.0}),
-            (3, mid_level, [(0, mid_level, "support" if mid_level < float(df_slice[close_col].iloc[-1]) else "resistance")], {"upper_bound": mid_level * 1.002, "lower_bound": mid_level * 0.998, "total_volume": 35000.0, "net_volume": 2000.0}),
-        ]
-        zone_manager.add_snapshot(f"snap_{len(zone_manager.history)}", "15m", raw_z)
+        df_slice = df_full.iloc[max(0, up_to_idx - lookback_period): up_to_idx + 1].copy()
+        df_slice = df_slice.rename(columns={
+            high_col: "High", low_col: "Low", close_col: "Close", open_col: "Open", vol_col: "Volume"
+        })
 
-    _update_dynamic_zones(aligned_df)
+        if "High" not in df_slice.columns or "Low" not in df_slice.columns:
+            return
+
+        levels = detect_snr_levels_sequential(
+            price_data=df_slice,
+            up_to_index=len(df_slice) - 1,
+            lookback_period=min(lookback_period, len(df_slice) - 1),
+        )
+
+        if not levels:
+            return
+
+        raw_zones = create_clustered_zones_sequential(
+            levels=levels,
+            price_data_slice=df_slice,
+            n_clusters=min(8, max(3, len(levels))),
+        )
+
+        if raw_zones:
+            ts = df_slice.index[-1] if hasattr(df_slice.index[-1], "to_pydatetime") else None
+            zm.add_snapshot(
+                snapshot_id=f"snap_{up_to_idx}",
+                timeframe=timeframe,
+                zones_raw=raw_zones,
+                timestamp=ts if isinstance(ts, datetime) else None,
+            )
 
     # ── Phase 1: Meta-Learner Training ────────────────────────────────────────
     META_TRAIN_STEPS = 500
@@ -387,6 +429,10 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
         cp = float(row_pf[close_col])
         np_ = float(next_row_pf[close_col])
         fwd_pf = (np_ - cp) / (cp + 1e-8)
+
+        # Update real SNR snapshot up to current bar (NO LOOKAHEAD)
+        update_real_snr_snapshot(train_df, idx, zone_manager)
+        zone_manager.update_invalidation(cp, float(row_pf[high_col]), float(row_pf[low_col]))
         f_dict_pf = _row_to_feature_dict(row_pf, close_col, vol_col)
         pred_pf = meta_learner.predict(f_dict_pf)
         ms_pf = float(pred_pf.get("signal_strength", 0.5))
@@ -433,6 +479,11 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
         cur_price = float(row[close_col])
         next_price = float(next_row[close_col])
         fwd_move_pct = (next_price - cur_price) / (cur_price + 1e-8)
+
+        # Update real SNR snapshot up to current training bar (NO LOOKAHEAD)
+        update_real_snr_snapshot(train_df, idx, zone_manager)
+        zone_manager.update_invalidation(cur_price, float(row[high_col]), float(row[low_col]))
+
         f_dict = _row_to_feature_dict(row, close_col, vol_col)
         pred = meta_learner.predict(f_dict)
         meta_score = float(pred.get("signal_strength", 0.5))
@@ -501,7 +552,7 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
             has_open_position = (idx < open_trade_until_idx)
 
             if idx % 50 == 0:
-                _update_dynamic_zones(test_df.iloc[max(0, idx - 1000): idx + 1])
+                update_real_snr_snapshot(test_df, idx, zone_manager)
             zone_manager.update_invalidation(cur_price, float(row[high_col]), float(row[low_col]))
 
             f_dict = _row_to_feature_dict(row, close_col, vol_col)
@@ -645,7 +696,7 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
         cur_price = float(row[close_col])
 
         if idx % 50 == 0:
-            _update_dynamic_zones(test_df.iloc[max(0, idx - 1000): idx + 1])
+            update_real_snr_snapshot(test_df, idx, zone_manager)
         zone_manager.update_invalidation(cur_price, float(row[high_col]), float(row[low_col]))
 
         f_dict = _row_to_feature_dict(row, close_col, vol_col)
