@@ -452,49 +452,52 @@ def _hidden_dim_for(input_dim: int) -> int:
 
 class SignalMetaNetwork(nn.Module):
     """
-    Two-Branch Ensemble Deep PyTorch Network for Signal Meta-Learning.
-    Mirrors tt.py ensemble architecture:
-    - Branch 1 (Dense TI Tower): Deep feature extraction over full input vector with LayerNorm & SiLU.
-    - Branch 2 (Multi-Scale Grouped Tower): Grouped projections over semantic TI sub-groups (MAs/RSI, Volatility, SMC, Context).
-    - Per-Branch Auxiliary Heads (aux1, aux2): Independent prediction heads per branch.
+    3D Temporal Conv1D + LSTM Ensemble Deep PyTorch Network for Signal Meta-Learning.
+    Mirrors tt.py AXE Genesis architecture:
+    - Preserves 3D Sequence Input shape (Batch, SeqLen, Features) without flattening.
+    - Branch 1 (Full Sequence 100%): 2-Block Conv1D + LSTM(64) sequence encoder.
+    - Branch 2 (Mid-Term 50% Slice): Private Conv1D temporal encoder over recent 50% sequence.
+    - Branch 3 (Short-Term 30% Slice): Private Conv1D temporal encoder over recent 30% sequence.
+    - Per-Branch Auxiliary Heads (aux1, aux2): Independent prediction heads on detached branch outputs.
     - StopGradient Isolation: aux predictions are detached before feeding into Gated Ensemble Fusion Head.
-    - Gated Ensemble Fusion Head: Combines b1_out, b2_out, aux1_sg, aux2_sg for multi-head signal predictions.
+    - Gated Ensemble Fusion Head: Combines b1_out (128), b2_out (64), b3_out (64), aux1_sg (5), aux2_sg (5) -> (266) -> hidden_dim (256).
     """
 
-    def __init__(self, input_dim: int = DECISION_WINDOW_DIM, num_actions: int = 4, hidden_dim: int = 256):
+    def __init__(self, input_dim: int = DECISION_WINDOW_DIM, num_actions: int = 4, hidden_dim: int = 256, num_features: int = 238):
         super().__init__()
+        self.num_features = num_features
         hidden_dim = hidden_dim or _hidden_dim_for(input_dim)
 
-        # Branch 1: Dense Feature Extraction Tower
-        self.b1_fc1 = nn.Linear(input_dim, hidden_dim)
-        self.b1_ln1 = nn.LayerNorm(hidden_dim)
-        self.b1_act1 = nn.SiLU()
-        self.b1_drop = nn.Dropout(0.0)  # Disabled dropout for regression convergence
-        self.b1_fc2 = nn.Linear(hidden_dim, 128)
-        self.b1_ln2 = nn.LayerNorm(128)
-        self.b1_act2 = nn.SiLU()
+        # Branch 1: Full Sequence (100%) Conv1D + LSTM Tower
+        self.b1_conv1 = nn.Conv1d(num_features, 128, kernel_size=3, padding=1)
+        self.b1_bn1   = nn.BatchNorm1d(128)
+        self.b1_act1  = nn.SiLU()
+        self.b1_conv2 = nn.Conv1d(128, 64, kernel_size=3, padding=1)
+        self.b1_bn2   = nn.BatchNorm1d(64)
+        self.b1_act2  = nn.SiLU()
+        self.b1_lstm  = nn.LSTM(64, 64, batch_first=True)
 
-        # Branch 2: Multi-Scale Grouped Feature Tower
-        # Divide input vector into 4 equal semantic chunks
-        c_dim = max(1, input_dim // 4)
-        rem = input_dim - (c_dim * 3)
-        self.b2_c1 = nn.Linear(c_dim, 64)
-        self.b2_c2 = nn.Linear(c_dim, 64)
-        self.b2_c3 = nn.Linear(c_dim, 64)
-        self.b2_c4 = nn.Linear(rem, 64)
-        self.b2_fusion = nn.Linear(256, 128)
-        self.b2_ln = nn.LayerNorm(128)
-        self.b2_act = nn.SiLU()
+        # Branch 2: Mid-Term (50% Slice) Conv1D Tower
+        self.b2_conv  = nn.Conv1d(num_features, 64, kernel_size=3, padding=1)
+        self.b2_bn    = nn.BatchNorm1d(64)
+        self.b2_act   = nn.SiLU()
+        self.b2_fc    = nn.Linear(64, 64)
 
-        # Auxiliary Supervised Heads per branch (predicting 4-horizon strengths & reversal)
+        # Branch 3: Short-Term (30% Slice) Conv1D Tower
+        self.b3_conv  = nn.Conv1d(num_features, 64, kernel_size=3, padding=1)
+        self.b3_bn    = nn.BatchNorm1d(64)
+        self.b3_act   = nn.SiLU()
+        self.b3_fc    = nn.Linear(64, 64)
+
+        # Auxiliary Supervised Heads per branch
         self.aux1_head = nn.Linear(128, 5)  # [strength_5m, strength_15m, strength_30m, strength_1h, reversal_aux]
-        self.aux2_head = nn.Linear(128, 5)  # [strength_5m, strength_15m, strength_30m, strength_1h, reversal_aux]
+        self.aux2_head = nn.Linear(64, 5)
 
         # Gated Ensemble Fusion Head
-        # Inputs: b1_out (128) + b2_out (128) + aux1_sg (5) + aux2_sg (5) = 266
-        self.fusion_fc1 = nn.Linear(128 + 128 + 5 + 5, hidden_dim)
-        self.fusion_ln1 = nn.LayerNorm(hidden_dim)
-        self.fusion_act1 = nn.SiLU()
+        # Inputs: b1_out (128) + b2_out (64) + b3_out (64) + aux1_sg (5) + aux2_sg (5) = 266
+        self.fusion_fc   = nn.Linear(128 + 64 + 64 + 5 + 5, hidden_dim)
+        self.fusion_ln   = nn.LayerNorm(hidden_dim)
+        self.fusion_act  = nn.SiLU()
 
         self.q_head = nn.Linear(hidden_dim, num_actions)
         self.strength_head = nn.Sequential(
@@ -502,11 +505,8 @@ class SignalMetaNetwork(nn.Module):
             nn.Sigmoid(),
         )
 
-        # Each auxiliary head gets its OWN 2-layer MLP with a private
-        # projection off the merged branch features (128+128=256 input).
-        # Shared LayerNorm before all private aux projections
-        # Prevents raw branch activations from saturating the aux MLPs.
-        _aux_in = 256  # b1_out(128) + b2_out(128)
+        # Auxiliary Private Projections (Zero Gradient Interference)
+        _aux_in = 128 + 64 + 64  # b1(128) + b2(64) + b3(64) = 256
         self.branch_ln = nn.LayerNorm(_aux_in)
 
         self.pips_proj = nn.Linear(_aux_in, 64)
@@ -546,46 +546,67 @@ class SignalMetaNetwork(nn.Module):
             nn.Sigmoid(),
         )
 
-        self._c_dim = c_dim
-
+    def _prepare_3d(self, x: torch.Tensor) -> torch.Tensor:
+        """Convert flat (B, T*C) or 2D inputs into 3D (B, T, C) sequence shape."""
+        if x.ndim == 2:
+            b, dim = x.shape
+            c = self.num_features
+            t = dim // c if dim >= c else 1
+            if t * c != dim:
+                # If feature dimension doesn't divide cleanly, pad or truncate
+                c = dim
+                t = 1
+            return x.view(b, t, c)
+        return x
 
     def forward(
         self, x: torch.Tensor, return_aux: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[Any, ...]:
-        # ── Branch 1 ────────────────────────────────────────────────────────
-        b1 = self.b1_act1(self.b1_ln1(self.b1_fc1(x)))
-        b1 = self.b1_drop(b1)
-        b1_out = self.b1_act2(self.b1_ln2(self.b1_fc2(b1)))
+        x_3d = self._prepare_3d(x)  # (B, T, C)
+        b, t, c = x_3d.shape
 
-        # ── Branch 2 ────────────────────────────────────────────────────────
-        c = self._c_dim
-        g1 = torch.relu(self.b2_c1(x[:, :c]))
-        g2 = torch.relu(self.b2_c2(x[:, c:2*c]))
-        g3 = torch.relu(self.b2_c3(x[:, 2*c:3*c]))
-        g4 = torch.relu(self.b2_c4(x[:, 3*c:]))
-        b2_cat = torch.cat([g1, g2, g3, g4], dim=-1)
-        b2_out = self.b2_act(self.b2_ln(self.b2_fusion(b2_cat)))
+        # Transpose to (B, C, T) for PyTorch Conv1D
+        x_trans = x_3d.transpose(1, 2)
+
+        # ── Branch 1: Full Sequence (100%) Conv1D + LSTM ────────────────────
+        b1_c1 = self.b1_act1(self.b1_bn1(self.b1_conv1(x_trans)))
+        b1_c2 = self.b1_act2(self.b1_bn2(self.b1_conv2(b1_c1)))
+        b1_c2_trans = b1_c2.transpose(1, 2)  # (B, T, 64)
+        b1_lstm_out, _ = self.b1_lstm(b1_c2_trans)  # (B, T, 64)
+        b1_last = b1_lstm_out[:, -1, :]  # (B, 64)
+        b1_gap  = torch.mean(b1_lstm_out, dim=1)  # (B, 64)
+        b1_out  = torch.cat([b1_last, b1_gap], dim=-1)  # (B, 128)
+
+        # ── Branch 2: Mid-Term (50% Slice) Conv1D ───────────────────────────
+        half = max(1, t // 2)
+        x_mid_trans = x_trans[:, :, -half:]
+        b2_c = self.b2_act(self.b2_bn(self.b2_conv(x_mid_trans)))
+        b2_gap = torch.mean(b2_c, dim=-1)  # (B, 64)
+        b2_out = torch.relu(self.b2_fc(b2_gap))  # (B, 64)
+
+        # ── Branch 3: Short-Term (30% Slice) Conv1D ──────────────────────────
+        recent = max(1, int(t * 0.3))
+        x_rec_trans = x_trans[:, :, -recent:]
+        b3_c = self.b3_act(self.b3_bn(self.b3_conv(x_rec_trans)))
+        b3_gap = torch.mean(b3_c, dim=-1)  # (B, 64)
+        b3_out = torch.relu(self.b3_fc(b3_gap))  # (B, 64)
 
         # ── Auxiliary Supervision & StopGradient Detaching ───────────────────
-        # Detach b1_out and b2_out so auxiliary losses update ONLY private aux head parameters
-        # and NEVER corrupt shared trunk representations (matching tt.py solo head isolation)
         aux1 = self.aux1_head(b1_out.detach())
         aux2 = self.aux2_head(b2_out.detach())
 
         aux1_sg = aux1.detach()
         aux2_sg = aux2.detach()
 
-        # ── Gated Fusion Layer ───────────────────────────────────────────────
-        fusion_in = torch.cat([b1_out, b2_out, aux1_sg, aux2_sg], dim=-1)
-        feat = self.fusion_act1(self.fusion_ln1(self.fusion_fc1(fusion_in)))
+        # ── Gated Ensemble Fusion Layer ──────────────────────────────────────
+        fusion_in = torch.cat([b1_out, b2_out, b3_out, aux1_sg, aux2_sg], dim=-1)
+        feat = self.fusion_act(self.fusion_ln(self.fusion_fc(fusion_in)))
 
         q_vals   = self.q_head(feat)
         strength = self.strength_head(feat)
 
         # ── Private-projection auxiliary heads (Zero Gradient Interference) ─
-        # Detach branch_cat so aux head losses do NOT pollute b1_out/b2_out feature representations
-        # while private MLPs (pips, risk, liquidity, reversal) train independently.
-        branch_cat = self.branch_ln(torch.cat([b1_out, b2_out], dim=-1).detach())  # (B, 256)
+        branch_cat = self.branch_ln(torch.cat([b1_out, b2_out, b3_out], dim=-1).detach())  # (B, 256)
 
         pips      = self.pips_head(self.pips_ln(self.pips_proj(branch_cat)))
         risk      = self.risk_head(self.risk_ln(self.risk_proj(branch_cat)))
