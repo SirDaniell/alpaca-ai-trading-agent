@@ -411,24 +411,30 @@ class OptionsQExecutor:
         risk_limit_breached: bool = False,
     ) -> float:
         """
-        Calculate delayed risk-adjusted reward for LTF execution.
+        Calculate delayed risk-adjusted reward for LTF execution adhering to options-repurposing-directives.md.
 
         Components:
-        1. Delayed Realized P&L: Realized P&L / (max_drawdown_exposed + 1e-4) on close.
-        2. Overtrade Churn Penalty: Fixed penalty (-0.05) on entry to account for option spreads.
-        3. Disciplined Stop-Loss Bonus: (+0.2) reward for correctly executing stop-outs.
-        4. Hindsight Missed-Opportunity Penalty:
-           Penalizes choosing ACTION_WAIT (0) when:
-           - All hard entry gates passed (action_mask[1]==1 or action_mask[2]==1).
-           - HTF conviction >= 0.65.
-           - Forward price moved cleanly in setup direction (|forward_move_pct| >= 0.5%).
-           - Risk limits were NOT breached (respecting risk limits is never penalized).
+        1. Overtrade Churn Penalty (-0.05) on BUY_CALL / BUY_PUT entry to account for option spreads.
+        2. Best Price Entry Bonus (+0.15): Rewarded when entering in direction of move with low drawdown.
+        3. Realized P&L & Stop Loss reward on position close.
+        4. Wise Patience Reward vs Hindsight Missed-Opportunity Penalty on ACTION_WAIT:
+           - Rewards ACTION_WAIT when the unmasked setup would have resulted in an adverse loss.
+           - Penalizes ACTION_WAIT when all entry gates passed, HTF strength >= 0.65, and move played out.
+           - Grants small discipline bonus (+0.02) when standing down in low-conviction regimes.
         """
         reward = 0.0
 
-        # 1. Overtrade churn penalty on entry
+        # 1. Entry & Quality Sizing
         if action in (ACTION_BUY_CALL, ACTION_BUY_PUT):
-            reward -= 0.05
+            reward -= 0.05  # Churn penalty for option spread
+
+            # Best Price Entry Bonus: minimal drawdown & strong move in setup direction
+            if action == ACTION_BUY_CALL and forward_move_pct >= 0.003:
+                dd_factor = max(0.0, 1.0 - (max_drawdown_exposed / 0.005))
+                reward += float(np.clip(0.15 * (forward_move_pct / 0.003) * dd_factor, 0.0, 0.35))
+            elif action == ACTION_BUY_PUT and forward_move_pct <= -0.003:
+                dd_factor = max(0.0, 1.0 - (max_drawdown_exposed / 0.005))
+                reward += float(np.clip(0.15 * (abs(forward_move_pct) / 0.003) * dd_factor, 0.0, 0.35))
 
         # 2. Realized P&L & Stop Loss reward on position close
         if is_closed:
@@ -439,19 +445,37 @@ class OptionsQExecutor:
                 # Reinforce correct stop-loss execution vs holding losers
                 reward += 0.20
 
-        # 3. Hindsight Missed-Opportunity Penalty (Only on ACTION_WAIT when flat)
+        # 3. Wise Patience Reward vs Hindsight Missed-Opportunity Penalty (ACTION_WAIT)
         if action == ACTION_WAIT and not is_closed and not risk_limit_breached:
-            # Check if BUY_CALL was unmasked and bullish setup played out
-            if action_mask[ACTION_BUY_CALL] == 1 and htf_bias.strength >= 0.65 and forward_move_pct >= 0.005:
-                penalty = float(np.clip(-0.15 * (forward_move_pct / 0.005), -0.5, 0.0))
-                reward += penalty
-                logger.debug("[HindsightReward] Missed Call entry penalty applied: %.3f", penalty)
+            # Bullish Setup Evaluation (BUY_CALL unmasked)
+            if action_mask[ACTION_BUY_CALL] == 1 and htf_bias.strength >= 0.65:
+                if forward_move_pct >= 0.003:
+                    # Missed winning setup penalty
+                    penalty = float(np.clip(-0.15 * (forward_move_pct / 0.003), -0.5, 0.0))
+                    reward += penalty
+                    logger.debug("[HindsightReward] Missed Call entry penalty applied: %.3f", penalty)
+                elif forward_move_pct < 0.0:
+                    # Wise patience bonus: avoided a losing bullish entry
+                    patience_bonus = float(np.clip(0.15 * (abs(forward_move_pct) / 0.003), 0.0, 0.30))
+                    reward += patience_bonus
+                    logger.debug("[PatienceReward] Avoided Call loss bonus applied: %.3f", patience_bonus)
 
-            # Check if BUY_PUT was unmasked and bearish setup played out
-            elif action_mask[ACTION_BUY_PUT] == 1 and htf_bias.strength >= 0.65 and forward_move_pct <= -0.005:
-                penalty = float(np.clip(-0.15 * (abs(forward_move_pct) / 0.005), -0.5, 0.0))
-                reward += penalty
-                logger.debug("[HindsightReward] Missed Put entry penalty applied: %.3f", penalty)
+            # Bearish Setup Evaluation (BUY_PUT unmasked)
+            elif action_mask[ACTION_BUY_PUT] == 1 and htf_bias.strength >= 0.65:
+                if forward_move_pct <= -0.003:
+                    # Missed winning setup penalty
+                    penalty = float(np.clip(-0.15 * (abs(forward_move_pct) / 0.003), -0.5, 0.0))
+                    reward += penalty
+                    logger.debug("[HindsightReward] Missed Put entry penalty applied: %.3f", penalty)
+                elif forward_move_pct > 0.0:
+                    # Wise patience bonus: avoided a losing bearish entry
+                    patience_bonus = float(np.clip(0.15 * (forward_move_pct / 0.003), 0.0, 0.30))
+                    reward += patience_bonus
+                    logger.debug("[PatienceReward] Avoided Put loss bonus applied: %.3f", patience_bonus)
+
+            else:
+                # Discipline bonus for staying flat when no high-conviction setup exists
+                reward += 0.02
 
         return float(np.clip(reward, -3.0, 3.0))
 

@@ -153,7 +153,7 @@ class ZoneSnapshotManager:
             self._active_zones.pop(z_id, None)
 
         if invalidated:
-            logger.info("[ZoneSnapshot] Invalidated %d zones on close_price=%.4f", len(invalidated), close_price)
+            logger.debug("[ZoneSnapshot] Invalidated %d zones on close_price=%.4f", len(invalidated), close_price)
         return invalidated
 
     def _recompute_confluence(self) -> None:

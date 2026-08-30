@@ -25,7 +25,7 @@ from app.core.ml.real_data_pipeline import (
     align_multi_timeframe_datasets,
     _htf_start_for,
 )
-from app.core.options.q_executor import OptionsQExecutor, HTFBiasPackage, AccountContext, ExecutionContext
+from app.core.options.q_executor import OptionsQExecutor, HTFBiasPackage, AccountContext, ExecutionContext, EXECUTOR_STATE_DIM
 from app.core.market.zone_snapshot import ZoneSnapshotManager, HardActionMask
 from app.core.ml.signal_meta_learner import OnlineSignalMetaLearner, SIGNAL_META_FEATURE_COUNT
 
@@ -201,10 +201,29 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
     ltf_anchor = ltf_df["timestamp"].min().to_pydatetime()
     tf_dfs = {"5m": ltf_df}
 
+    import signal as _signal
+
+    def _fetch_with_timeout(symbol, tf, limit, start, timeout_sec=90):
+        """Fetch HTF candles with a hard timeout to prevent indefinite hangs."""
+        result = [None]
+        def _handler(signum, frame):
+            raise TimeoutError(f"[DataFetch] Timed out fetching {tf} bars for {symbol}")
+        prev = _signal.signal(_signal.SIGALRM, _handler)
+        _signal.alarm(timeout_sec)
+        try:
+            result[0] = fetch_real_candles(symbol, timeframe=tf, limit=limit, start=start)
+        except TimeoutError as e:
+            logger.warning("%s — skipping timeframe.", e)
+            result[0] = None
+        finally:
+            _signal.alarm(0)
+            _signal.signal(_signal.SIGALRM, prev)
+        return result[0]
+
     for tf in ["15m", "1h", "4h", "1d"]:
         start_str = _htf_start_for(ltf_anchor, tf, lookback_bars=1000)
-        df_htf = fetch_real_candles(symbol, timeframe=tf, limit=limit, start=start_str)
-        if not df_htf.empty:
+        df_htf = _fetch_with_timeout(symbol, tf, limit, start_str)
+        if df_htf is not None and not df_htf.empty:
             tf_dfs[tf] = df_htf
 
     aligned_df = align_multi_timeframe_datasets(tf_dfs, primary_tf="5m")
@@ -257,10 +276,10 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
 
     # 2. Train Two-Tier Ensemble Learners once on Train Set
     if framework == "keras":
-        from app.core.ml.keras_signal_meta_learner import KerasOnlineSignalMetaLearner
-        from app.core.options.keras_q_executor import KerasOptionsQExecutor
-        meta_learner = KerasOnlineSignalMetaLearner(num_features=238, lookback_bars=48, replay_capacity=20000)
-        q_executor = KerasOptionsQExecutor()
+        from app.core.ml.keras_signal_meta_learner import KerasSignalMetaLearner
+        from app.core.options.keras_trade_executor import KerasTradeExecutor
+        meta_learner = KerasSignalMetaLearner(num_features=238, lookback_bars=48, replay_capacity=20000)
+        q_executor   = KerasTradeExecutor(seq_len=1, n_features=EXECUTOR_STATE_DIM)
     else:
         meta_learner = OnlineSignalMetaLearner(input_dim=SIGNAL_META_FEATURE_COUNT, replay_capacity=20000)
         q_executor = OptionsQExecutor(device="cpu")
@@ -343,10 +362,10 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
             avg_aux2 = _meta_loss_aux2_acc / n_samples
             buf = train_metrics.get("buffer_size", "?")
             print(
-                f"  [Meta step {step+1:>4}/{META_TRAIN_STEPS}] total={avg_loss:.4f} | "
-                f"q={avg_q:.4f} | str={avg_str:.4f} | pips={avg_pips:.4f} | "
-                f"risk={avg_risk:.4f} | liq={avg_liq:.4f} | rev={avg_rev:.4f} | "
-                f"aux1={avg_aux1:.4f} | aux2={avg_aux2:.4f} | buf={buf}"
+                f"  [Meta step {step+1:>4}/{META_TRAIN_STEPS}] total={avg_loss:.4e} | "
+                f"q={avg_q:.4e} | str={avg_str:.4e} | pips={avg_pips:.4e} | "
+                f"risk={avg_risk:.4e} | liq={avg_liq:.4e} | rev={avg_rev:.4e} | "
+                f"aux1={avg_aux1:.4e} | aux2={avg_aux2:.4e} | buf={buf}"
             )
             _meta_loss_acc = _meta_loss_q_acc = _meta_loss_str_acc = 0.0
             _meta_loss_pips_acc = _meta_loss_risk_acc = _meta_loss_liq_acc = 0.0
@@ -356,8 +375,12 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
     Q_PREFILL_STEPS = 1000
     Q_TRAIN_STEPS = 700
     print(f"\n[Phase 2] Training Dual-Branch Ensemble Options Q-Learner ({Q_TRAIN_STEPS} gradient steps)...")
-    print(f"  Pre-filling replay buffer ({Q_PREFILL_STEPS} random transitions)...")
-    for _ in range(Q_PREFILL_STEPS):
+    print(f"  Pre-filling replay buffer ({Q_PREFILL_STEPS} high-outcome transitions)...")
+    filled_count = 0
+    attempts = 0
+    max_attempts = Q_PREFILL_STEPS * 10
+    while filled_count < Q_PREFILL_STEPS and attempts < max_attempts:
+        attempts += 1
         idx = np.random.randint(0, len(train_df) - 2)
         row_pf = train_df.iloc[idx]
         next_row_pf = train_df.iloc[idx + 1]
@@ -378,6 +401,11 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
             optimal_horizon_idx=int(pred_pf.get("optimal_horizon_idx", 2)),
             recommended_expiry=str(pred_pf.get("recommended_expiry", "30m")),
         )
+
+        # High-outcome filter: require high Meta-Learner conviction (strength >= 0.60) or clean directional move
+        if ms_pf < 0.60 and abs(fwd_pf) < 0.003:
+            continue
+
         ctx_pf = _make_exec_ctx(symbol, cp, dict(row_pf))
         st_pf = q_executor.build_state_vector(bias_pf, account, ctx_pf, zone_manager)
         mask_pf = np.ones(5, dtype=np.int32)
@@ -385,9 +413,14 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
         rew_pf = q_executor.calculate_executor_reward(
             action=act_pf, action_mask=mask_pf, pnl_pct=fwd_pf, max_drawdown_exposed=0.01, forward_move_pct=fwd_pf, htf_bias=bias_pf,
         )
-        nst_pf = q_executor.build_state_vector(bias_pf, account, ctx_pf, zone_manager)
-        q_executor.record_transition(st_pf, act_pf, rew_pf, nst_pf, False, mask_pf)
-    print(f"  Replay buffer pre-filled. Starting {Q_TRAIN_STEPS} gradient steps...")
+
+        # Filter out negative noise transitions during pre-fill
+        if rew_pf >= 0.0:
+            nst_pf = q_executor.build_state_vector(bias_pf, account, ctx_pf, zone_manager)
+            q_executor.record_transition(st_pf, act_pf, rew_pf, nst_pf, False, mask_pf)
+            filled_count += 1
+
+    print(f"  Replay buffer pre-filled with {filled_count} high-outcome transitions. Starting {Q_TRAIN_STEPS} gradient steps...")
 
     _q_loss_acc = 0.0
     Q_LOG_EVERY = 50
@@ -435,7 +468,7 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
             avg_q_loss = _q_loss_acc / Q_LOG_EVERY
             act_names = {0: "WAIT", 1: "CALL", 2: "PUT", 3: "TP_HALF", 4: "CLOSE"}
             dist_str = " | ".join(f"{act_names.get(a, a)}={c}" for a, c in sorted(action_dist.items()) if c > 0)
-            print(f"  [Q step {step+1:>4}/{Q_TRAIN_STEPS}] avg_loss={avg_q_loss:.4f} | actions[{dist_str}]")
+            print(f"  [Q step {step+1:>4}/{Q_TRAIN_STEPS}] avg_loss={avg_q_loss:.4e} | actions[{dist_str}]")
             _q_loss_acc = 0.0
             action_dist = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
 
@@ -494,11 +527,8 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
             action_mask = mask_engine.get_action_mask(
                 current_price=cur_price, atr=exec_ctx.atr, zone_manager=zone_manager, buy_volume=exec_ctx.buy_volume, sell_volume=exec_ctx.sell_volume, has_open_position=has_open_position,
             )
-            if not has_open_position and action_mask[1] == 0 and action_mask[2] == 0 and htf_bias.strength >= 0.50:
-                if htf_bias.direction == "bullish":
-                    action_mask[1] = 1
-                else:
-                    action_mask[2] = 1
+            # HardActionMask is authoritative — WAIT when zone/volume says no.
+            # Never force-unmask based on HTF bias strength.
 
             action = q_executor.select_action(state, action_mask, eval_mode=True)
 
@@ -656,11 +686,9 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
             action_mask = mask_engine.get_action_mask(
                 current_price=cur_price, atr=exec_ctx.atr, zone_manager=zone_manager, buy_volume=exec_ctx.buy_volume, sell_volume=exec_ctx.sell_volume, has_open_position=False,
             )
-            if action_mask[1] == 0 and action_mask[2] == 0:
-                if htf_bias.direction == "bullish":
-                    action_mask[1] = 1
-                else:
-                    action_mask[2] = 1
+            # HardActionMask is authoritative — WAIT is a valid outcome.
+            # Do NOT override the mask based on HTF bias here; that defeats
+            # the no-chase discipline and inflates trade counts artificially.
 
             action = q_executor.select_action(state, action_mask, eval_mode=True)
 
@@ -757,7 +785,54 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate Option Expiries Benchmark")
     parser.add_argument("--limit", type=int, default=40000, help="Candle limit per timeframe")
     parser.add_argument("--framework", type=str, choices=["keras", "pytorch"], default="keras", help="Model framework (keras or pytorch)")
+    parser.add_argument(
+        "--symbols", type=str,
+        default="GLD,SPY,QQQ,TLT,SLV,GDX,USO,EEM,XLF,XLE",
+        help=(
+            "Comma-separated list of equity/ETF symbols priced in USD (left-of-dollar). "
+            "BTC/USD is excluded — Alpaca does not offer options on crypto. "
+            "All symbols here are USD-denominated equities/ETFs with active Alpaca options chains, "
+            "so the DXY synthetic inversion signal is directionally consistent."
+        )
+    )
     args = parser.parse_args()
 
-    evaluate_expiries_for_symbol("GLD", limit=args.limit, framework=args.framework)
-    evaluate_expiries_for_symbol("BTC/USD", limit=args.limit, framework=args.framework)
+    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+
+    all_results = {}
+    for sym in symbols:
+        print(f"\n{'='*80}")
+        print(f"  SYMBOL: {sym} | Framework: {args.framework.upper()} | Limit: {args.limit}")
+        print(f"{'='*80}")
+        try:
+            result = evaluate_expiries_for_symbol(sym, limit=args.limit, framework=args.framework)
+            all_results[sym] = result
+        except Exception as exc:
+            logger.error("[%s] Evaluation failed: %s", sym, exc, exc_info=True)
+            all_results[sym] = {"error": str(exc)}
+
+    # ── Cross-symbol summary ───────────────────────────────────────────────────
+    print("\n" + "="*80)
+    print("  CROSS-SYMBOL EDGE SUMMARY")
+    print("="*80)
+    print(f"{'Symbol':<8} {'Trades':>7} {'Win Rate':>10} {'Best Horizon':<20} {'Alignment':>10}")
+    print("-"*60)
+    for sym, res in all_results.items():
+        if "error" in res:
+            print(f"{sym:<8}  ERROR: {res['error'][:50]}")
+            continue
+        port = res.get("COLLECTIVE_PORTFOLIO", {})
+        best_h, best_wr = "N/A", 0.0
+        for k, v in res.items():
+            if k == "COLLECTIVE_PORTFOLIO":
+                continue
+            wr = v.get("win_rate_pct", 0.0)
+            if wr > best_wr:
+                best_wr, best_h = wr, k
+        print(
+            f"{sym:<8} {port.get('total_trades', 0):>7} "
+            f"{port.get('win_rate_pct', 0.0):>9.2f}% "
+            f"{best_h:<20} "
+            f"{port.get('recommended_expiry_alignment_pct', 0.0):>9.1f}%"
+        )
+    print("="*80 + "\n")

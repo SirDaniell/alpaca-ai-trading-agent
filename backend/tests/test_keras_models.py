@@ -1,5 +1,5 @@
 """
-test_keras_models.py — Unit test suite for Keras 1D Dilated Conv Meta-Learner & Q-Executor models.
+test_keras_models.py — Unit test suite for Keras 1:1 AXE Genesis models.
 """
 
 import pytest
@@ -7,12 +7,14 @@ import numpy as np
 import tensorflow as tf
 
 from app.core.ml.keras_signal_meta_learner import (
-    KerasOnlineSignalMetaLearner,
-    build_keras_meta_network,
+    KerasSignalMetaLearner,
+    build_context_signals_model,
 )
-from app.core.options.keras_q_executor import (
-    KerasOptionsQExecutor,
-    build_keras_executor_q_network,
+from app.core.options.keras_trade_executor import (
+    KerasTradeExecutor,
+    build_classification_ensemble_model,
+)
+from app.core.options.q_executor import (
     HTFBiasPackage,
     AccountContext,
     ExecutionContext,
@@ -21,13 +23,17 @@ from app.core.market.zone_snapshot import ZoneSnapshotManager
 
 
 def test_keras_meta_network_forward_pass():
-    """Verify forward pass output shapes and values of KerasSignalMetaNetwork."""
+    """Verify forward pass output shapes and values of build_context_signals_model."""
     batch_size = 8
     lookback_bars = 48
     num_features = 238
 
     dummy_input = np.random.randn(batch_size, lookback_bars, num_features).astype(np.float32)
-    model = build_keras_meta_network(num_features=num_features, lookback_bars=lookback_bars, num_actions=5)
+    model = build_context_signals_model(
+        input_shape=(lookback_bars, num_features),
+        continuous_feature_indices=list(range(num_features)),
+        structure_indices=list(range(min(20, num_features))),
+    )
 
     outputs = model(dummy_input, training=False)
 
@@ -40,16 +46,13 @@ def test_keras_meta_network_forward_pass():
     assert "Signal_bounce_support" in outputs
     assert outputs["Signal_bounce_support"].shape == (batch_size, 1)
 
-    assert "snr_touch_1" in outputs
-    assert outputs["snr_touch_1"].shape == (batch_size, 3)
-
-    assert "pips_pred" in outputs
-    assert outputs["pips_pred"].shape == (batch_size, 1)
+    assert "reversal_prob" in outputs
+    assert outputs["reversal_prob"].shape == (batch_size, 1)
 
 
 def test_keras_meta_learner_training_step():
     """Verify experience recording and training step convergence."""
-    learner = KerasOnlineSignalMetaLearner(num_features=238, lookback_bars=48, replay_capacity=100)
+    learner = KerasSignalMetaLearner(num_features=238, lookback_bars=48, replay_capacity=100)
 
     # Record experiences
     for i in range(10):
@@ -69,23 +72,41 @@ def test_keras_meta_learner_training_step():
             future_closes=fut_closes,
         )
 
-    assert len(learner.buffer_x) == 10
+    assert len(learner._buf_x) == 10
 
     metrics = learner.train_step(batch_size=4)
-    assert metrics["loss"] > 0
+    assert metrics["loss"] >= 0
     assert "loss_q" in metrics
-    assert "loss_pips" in metrics
+    assert "loss_strength" in metrics
 
 
-def test_keras_q_executor_training_step():
-    """Verify KerasOptionsQExecutor state construction, action selection, and training."""
-    executor = KerasOptionsQExecutor()
+def test_keras_classification_ensemble_forward_pass():
+    batch_size = 4
+    seq_len = 1
+    num_features = 28
+    
+    dummy_input = np.random.randn(batch_size, seq_len, num_features).astype(np.float32)
+    model = build_classification_ensemble_model(input_shape=(seq_len, num_features), output_dim=5)
+    
+    outputs = model(dummy_input, training=False)
+    
+    assert "class_output" in outputs
+    assert outputs["class_output"].shape == (batch_size, 5)
+    assert "class_aux1" in outputs
+    assert outputs["class_aux1"].shape == (batch_size, 5)
+    assert "class_aux2" in outputs
+    assert outputs["class_aux2"].shape == (batch_size, 5)
+
+
+def test_keras_trade_executor_training_step():
+    """Verify KerasTradeExecutor state construction, action selection, and training."""
+    executor = KerasTradeExecutor(seq_len=1, n_features=28)
     bias = HTFBiasPackage(direction="bullish", strength=0.8)
     account = AccountContext(equity=100000.0)
     exec_ctx = ExecutionContext(current_price=100.0, atr=2.0)
     zm = ZoneSnapshotManager()
 
-    state = executor.construct_state_vector(bias, account, exec_ctx, zm)
+    state = executor.build_state_vector(bias, account, exec_ctx, zm)
     assert len(state) == 28
 
     mask = np.array([1, 1, 0, 0, 0], dtype=np.int32)

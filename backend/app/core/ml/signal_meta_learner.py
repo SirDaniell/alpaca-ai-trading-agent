@@ -501,11 +501,48 @@ class SignalMetaNetwork(nn.Module):
             nn.Linear(hidden_dim, 4),
             nn.Sigmoid(),
         )
-        self.pips_head = nn.Linear(hidden_dim, 4)
-        self.risk_head = nn.Linear(hidden_dim, 8)
-        self.liquidity_head = nn.Linear(hidden_dim, 2)
+
+        # Each auxiliary head gets its OWN 2-layer MLP with a private
+        # projection off the merged branch features (128+128=256 input).
+        # Shared LayerNorm before all private aux projections
+        # Prevents raw branch activations from saturating the aux MLPs.
+        _aux_in = 256  # b1_out(128) + b2_out(128)
+        self.branch_ln = nn.LayerNorm(_aux_in)
+
+        self.pips_proj = nn.Linear(_aux_in, 64)
+        self.pips_ln   = nn.LayerNorm(64)
+        self.pips_head = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(64, 32),
+            nn.SiLU(),
+            nn.Linear(32, 4),
+        )
+
+        self.risk_proj = nn.Linear(_aux_in, 64)
+        self.risk_ln   = nn.LayerNorm(64)
+        self.risk_head = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(64, 32),
+            nn.SiLU(),
+            nn.Linear(32, 8),
+        )
+
+        self.liq_proj = nn.Linear(_aux_in, 32)
+        self.liq_ln   = nn.LayerNorm(32)
+        self.liquidity_head = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(32, 16),
+            nn.SiLU(),
+            nn.Linear(16, 2),
+        )
+
+        self.rev_proj = nn.Linear(_aux_in, 32)
+        self.rev_ln   = nn.LayerNorm(32)
         self.reversal_head = nn.Sequential(
-            nn.Linear(hidden_dim, 1),
+            nn.SiLU(),
+            nn.Linear(32, 16),
+            nn.SiLU(),
+            nn.Linear(16, 1),
             nn.Sigmoid(),
         )
 
@@ -540,15 +577,18 @@ class SignalMetaNetwork(nn.Module):
         fusion_in = torch.cat([b1_out, b2_out, aux1_sg, aux2_sg], dim=-1)
         feat = self.fusion_act1(self.fusion_ln1(self.fusion_fc1(fusion_in)))
 
-        q_vals = self.q_head(feat)
+        q_vals   = self.q_head(feat)
         strength = self.strength_head(feat)
 
-        # ── Decoupled Auxiliary Heads (feat.detach stops gradient interference) ──
-        feat_aux = feat.detach()
-        pips = self.pips_head(feat_aux)
-        risk = self.risk_head(feat_aux)
-        liquidity = self.liquidity_head(feat_aux)
-        reversal = self.reversal_head(feat_aux)
+        # ── Private-projection auxiliary heads (Zero Gradient Interference) ─
+        # Detach branch_cat so aux head losses do NOT pollute b1_out/b2_out feature representations
+        # while private MLPs (pips, risk, liquidity, reversal) train independently.
+        branch_cat = self.branch_ln(torch.cat([b1_out, b2_out], dim=-1).detach())  # (B, 256)
+
+        pips      = self.pips_head(self.pips_ln(self.pips_proj(branch_cat)))
+        risk      = self.risk_head(self.risk_ln(self.risk_proj(branch_cat)))
+        liquidity = self.liquidity_head(self.liq_ln(self.liq_proj(branch_cat)))
+        reversal  = self.reversal_head(self.rev_ln(self.rev_proj(branch_cat)))
 
         if return_aux:
             return q_vals, strength, pips, risk, liquidity, reversal, aux1, aux2
@@ -794,31 +834,38 @@ class OnlineSignalMetaLearner:
         ).mean(dim=1))
 
         # Liquidity targets: distance normalized by 10.0, type by 2.0
+        # Guard: skip liquidity loss when all targets are zero (missing data)
         target_liquidity = torch.stack([
             next_zone_dist_atr / TARGET_ZONE_DIST_SCALE,
             next_zone_type / TARGET_ZONE_TYPE_SCALE
         ], dim=1)
-        loss_liquidity = torch.mean(weights_t * nn.functional.smooth_l1_loss(
-            liquidity_pred, target_liquidity, reduction='none'
-        ).mean(dim=1))
+        liq_mask = (target_liquidity.abs().sum(dim=1) > 1e-6).float()
+        if liq_mask.sum() > 0:
+            loss_liquidity = torch.mean(
+                liq_mask * nn.functional.smooth_l1_loss(
+                    liquidity_pred, target_liquidity, reduction='none'
+                ).mean(dim=1)
+            )
+        else:
+            loss_liquidity = torch.zeros(1, device=states.device).squeeze()
 
         loss_reversal = torch.mean(weights_t * ((reversal_pred.squeeze(1) - reversal_prob) ** 2))
 
-        # Branch-specific auxiliary supervision losses (aux1: Dense branch, aux2: Multi-Scale branch)
+        # Branch-specific auxiliary supervision losses
         target_aux = torch.cat([target_strength.repeat(1, 4), reversal_prob.unsqueeze(1)], dim=1)
         loss_aux1 = torch.mean(weights_t * nn.functional.smooth_l1_loss(aux1, target_aux, reduction='none').mean(dim=1))
         loss_aux2 = torch.mean(weights_t * nn.functional.smooth_l1_loss(aux2, target_aux, reduction='none').mean(dim=1))
 
-        # Balanced Total Loss: Core Q & Strength heads dominate, auxiliary heads contribute ~0.05-0.1 each
+        # Balanced Total Loss: raised weights for pips/risk/reversal to match Keras capacity
         total_loss = (
             loss_q
             + loss_strength
-            + 0.1 * loss_pips
-            + 0.1 * loss_risk
-            + 0.1 * loss_liquidity
-            + 0.1 * loss_reversal
-            + 0.1 * loss_aux1
-            + 0.1 * loss_aux2
+            + 0.3 * loss_pips
+            + 0.3 * loss_risk
+            + 0.05 * loss_liquidity
+            + 0.3 * loss_reversal
+            + 0.15 * loss_aux1
+            + 0.15 * loss_aux2
         )
 
         self.optimizer.zero_grad()
