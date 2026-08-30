@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import sys
+import random
 import logging
 import pprint
 import numpy as np
@@ -370,7 +371,14 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
     best_meta_weights = None
 
     for ep in range(META_EPOCHS):
-        for idx in range(total_train_bars):
+        # Epoch 1 runs sequentially (warm-up); subsequent epochs are shuffled.
+        # Each sample's 1,000-bar context window is still causally built internally,
+        # so shuffling presentation order is safe and breaks gradient autocorrelation.
+        epoch_indices = list(range(total_train_bars))
+        if ep > 0:
+            random.shuffle(epoch_indices)
+
+        for idx in epoch_indices:
             row = train_df.iloc[idx]
             fut_highs = train_df[high_col].iloc[idx+1:idx+13].values
             fut_lows = train_df[low_col].iloc[idx+1:idx+13].values
@@ -417,7 +425,9 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
                     buf = train_metrics.get("buffer_size", "?")
 
                     # Best Meta Weights Checkpoint Tracking
-                    if avg_loss < best_meta_loss:
+                    # Warmup guard: skip the first 500 steps so cold-start noise is never
+                    # incorrectly saved as the "best" weights.
+                    if global_step >= 500 and avg_loss < best_meta_loss:
                         best_meta_loss = avg_loss
                         if hasattr(meta_learner, "get_weights"):
                             best_meta_weights = meta_learner.get_weights()

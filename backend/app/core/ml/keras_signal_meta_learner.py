@@ -133,8 +133,8 @@ def _research_conv_block(x, filters, kernel_size, name_prefix):
 
 
 def _multiscale_research_conv_tower(tower_slice, seq_len, name_prefix,
-                                    filters=(128, 128, 64, 64, 64, 64),
-                                    kernel_size=6, fusion_dim=64):
+                                    filters=(64, 64, 32, 32, 32, 32),
+                                    kernel_size=6, fusion_dim=32):
     """tt.py line 467 — full / half / recent slice → GAP → concat → Dense."""
     half   = seq_len // 2
     recent = max(3, int(seq_len * 0.3))

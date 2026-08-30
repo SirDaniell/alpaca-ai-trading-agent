@@ -453,96 +453,105 @@ def _hidden_dim_for(input_dim: int) -> int:
 class SignalMetaNetwork(nn.Module):
     """
     3D Temporal Conv1D + LSTM Ensemble Deep PyTorch Network for Signal Meta-Learning.
-    Mirrors tt.py AXE Genesis architecture:
+    Mirrors tt.py AXE Genesis architecture with halved filter dimensions (/2 for fast training):
     - Preserves 3D Sequence Input shape (Batch, SeqLen, Features) without flattening.
-    - Branch 1 (Full Sequence 100%): 2-Block Conv1D + LSTM(64) sequence encoder.
-    - Branch 2 (Mid-Term 50% Slice): Private Conv1D temporal encoder over recent 50% sequence.
-    - Branch 3 (Short-Term 30% Slice): Private Conv1D temporal encoder over recent 30% sequence.
+    - Branch 1 (Full Sequence 100%): 2-Block Conv1D + LSTM(32) sequence encoder -> (64 dim).
+    - Branch 2 (Mid-Term 50% Slice): Private Conv1D temporal encoder over recent 50% sequence -> (32 dim).
+    - Branch 3 (Short-Term 30% Slice): Private Conv1D temporal encoder over recent 30% sequence -> (32 dim).
     - Per-Branch Auxiliary Heads (aux1, aux2): Independent prediction heads on detached branch outputs.
     - StopGradient Isolation: aux predictions are detached before feeding into Gated Ensemble Fusion Head.
-    - Gated Ensemble Fusion Head: Combines b1_out (128), b2_out (64), b3_out (64), aux1_sg (5), aux2_sg (5) -> (266) -> hidden_dim (256).
+    - Gated Ensemble Fusion Head: Combines b1_out (64), b2_out (32), b3_out (32), aux1_sg (5), aux2_sg (5) -> (138) -> hidden_dim (128).
     """
 
-    def __init__(self, input_dim: int = DECISION_WINDOW_DIM, num_actions: int = 4, hidden_dim: int = 256, num_features: int = 238):
+    def __init__(self, input_dim: int = DECISION_WINDOW_DIM, num_actions: int = 4, hidden_dim: int = 128, num_features: int = 238):
         super().__init__()
         self.num_features = num_features
-        hidden_dim = hidden_dim or _hidden_dim_for(input_dim)
+        hidden_dim = hidden_dim or 128
 
-        # Branch 1: Full Sequence (100%) Conv1D + LSTM Tower
-        self.b1_conv1 = nn.Conv1d(num_features, 128, kernel_size=3, padding=1)
-        self.b1_bn1   = nn.BatchNorm1d(128)
+        # Branch 1: Full Sequence (100%) Conv1D + LSTM Tower (Halved)
+        self.b1_conv1 = nn.Conv1d(num_features, 64, kernel_size=3, padding=1)
+        self.b1_bn1   = nn.BatchNorm1d(64)
         self.b1_act1  = nn.SiLU()
-        self.b1_conv2 = nn.Conv1d(128, 64, kernel_size=3, padding=1)
-        self.b1_bn2   = nn.BatchNorm1d(64)
+        self.b1_conv2 = nn.Conv1d(64, 32, kernel_size=3, padding=1)
+        self.b1_bn2   = nn.BatchNorm1d(32)
         self.b1_act2  = nn.SiLU()
-        self.b1_lstm  = nn.LSTM(64, 64, batch_first=True)
+        self.b1_lstm  = nn.LSTM(32, 32, batch_first=True)
 
-        # Branch 2: Mid-Term (50% Slice) Conv1D Tower
-        self.b2_conv  = nn.Conv1d(num_features, 64, kernel_size=3, padding=1)
-        self.b2_bn    = nn.BatchNorm1d(64)
+        # Branch 2: Mid-Term (50% Slice) Conv1D Tower (Halved)
+        self.b2_conv  = nn.Conv1d(num_features, 32, kernel_size=3, padding=1)
+        self.b2_bn    = nn.BatchNorm1d(32)
         self.b2_act   = nn.SiLU()
-        self.b2_fc    = nn.Linear(64, 64)
+        self.b2_fc    = nn.Linear(32, 32)
 
-        # Branch 3: Short-Term (30% Slice) Conv1D Tower
-        self.b3_conv  = nn.Conv1d(num_features, 64, kernel_size=3, padding=1)
-        self.b3_bn    = nn.BatchNorm1d(64)
+        # Branch 3: Short-Term (30% Slice) Conv1D Tower (Halved)
+        self.b3_conv  = nn.Conv1d(num_features, 32, kernel_size=3, padding=1)
+        self.b3_bn    = nn.BatchNorm1d(32)
         self.b3_act   = nn.SiLU()
-        self.b3_fc    = nn.Linear(64, 64)
+        self.b3_fc    = nn.Linear(32, 32)
 
-        # Auxiliary Supervised Heads per branch
-        self.aux1_head = nn.Linear(128, 5)  # [strength_5m, strength_15m, strength_30m, strength_1h, reversal_aux]
-        self.aux2_head = nn.Linear(64, 5)
+        # Auxiliary Supervised Heads per branch (Halved)
+        self.aux1_head = nn.Linear(64, 5)   # [strength_5m, strength_15m, strength_30m, strength_1h, reversal_aux]
+        self.aux2_head = nn.Linear(32, 5)
 
-        # Gated Ensemble Fusion Head
-        # Inputs: b1_out (128) + b2_out (64) + b3_out (64) + aux1_sg (5) + aux2_sg (5) = 266
-        self.fusion_fc   = nn.Linear(128 + 64 + 64 + 5 + 5, hidden_dim)
+        # Gated Ensemble Fusion Head (2-layer for sufficient joint representation capacity)
+        # Inputs: b1_out (64) + b2_out (32) + b3_out (32) + aux1_sg (5) + aux2_sg (5) = 138
+        # Gradient path: q_loss + strength_loss → fusion_fc2 → fusion_fc → branch towers (intended).
+        # Private aux heads use detached branch_cat so they CANNOT contaminate this path.
+        self.fusion_fc   = nn.Linear(64 + 32 + 32 + 5 + 5, hidden_dim)
         self.fusion_ln   = nn.LayerNorm(hidden_dim)
         self.fusion_act  = nn.SiLU()
+        self.fusion_fc2  = nn.Linear(hidden_dim, hidden_dim)   # depth for joint embedding
+        self.fusion_ln2  = nn.LayerNorm(hidden_dim)
+        self.fusion_act2 = nn.SiLU()
 
         self.q_head = nn.Linear(hidden_dim, num_actions)
         self.strength_head = nn.Sequential(
             nn.Linear(hidden_dim, 4),
             nn.Sigmoid(),
         )
+        # Fusion Selector Head: predicts the optimal horizon index (0-3) via CrossEntropy.
+        # Forces fusion neurons to learn a routing representation jointly aware of all heads.
+        # Gradient path: loss_selector → fusion_fc2 → fusion_fc → branch towers (intended).
+        self.fusion_selector = nn.Linear(hidden_dim, 4)
 
-        # Auxiliary Private Projections (Zero Gradient Interference)
-        _aux_in = 128 + 64 + 64  # b1(128) + b2(64) + b3(64) = 256
+        # Auxiliary Private Projections (Zero Gradient Interference, Halved)
+        _aux_in = 64 + 32 + 32  # b1(64) + b2(32) + b3(32) = 128
         self.branch_ln = nn.LayerNorm(_aux_in)
 
-        self.pips_proj = nn.Linear(_aux_in, 64)
-        self.pips_ln   = nn.LayerNorm(64)
+        self.pips_proj = nn.Linear(_aux_in, 32)
+        self.pips_ln   = nn.LayerNorm(32)
         self.pips_head = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(64, 32),
+            nn.Linear(32, 16),
             nn.SiLU(),
-            nn.Linear(32, 4),
+            nn.Linear(16, 4),
         )
 
-        self.risk_proj = nn.Linear(_aux_in, 64)
-        self.risk_ln   = nn.LayerNorm(64)
+        self.risk_proj = nn.Linear(_aux_in, 32)
+        self.risk_ln   = nn.LayerNorm(32)
         self.risk_head = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(64, 32),
+            nn.Linear(32, 16),
             nn.SiLU(),
-            nn.Linear(32, 8),
+            nn.Linear(16, 8),
         )
 
-        self.liq_proj = nn.Linear(_aux_in, 32)
-        self.liq_ln   = nn.LayerNorm(32)
+        self.liq_proj = nn.Linear(_aux_in, 16)
+        self.liq_ln   = nn.LayerNorm(16)
         self.liquidity_head = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(32, 16),
+            nn.Linear(16, 8),
             nn.SiLU(),
-            nn.Linear(16, 2),
+            nn.Linear(8, 2),
         )
 
-        self.rev_proj = nn.Linear(_aux_in, 32)
-        self.rev_ln   = nn.LayerNorm(32)
+        self.rev_proj = nn.Linear(_aux_in, 16)
+        self.rev_ln   = nn.LayerNorm(16)
         self.reversal_head = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(32, 16),
+            nn.Linear(16, 8),
             nn.SiLU(),
-            nn.Linear(16, 1),
+            nn.Linear(8, 1),
             nn.Sigmoid(),
         )
 
@@ -553,7 +562,6 @@ class SignalMetaNetwork(nn.Module):
             c = self.num_features
             t = dim // c if dim >= c else 1
             if t * c != dim:
-                # If feature dimension doesn't divide cleanly, pad or truncate
                 c = dim
                 t = 1
             return x.view(b, t, c)
@@ -571,25 +579,25 @@ class SignalMetaNetwork(nn.Module):
         # ── Branch 1: Full Sequence (100%) Conv1D + LSTM ────────────────────
         b1_c1 = self.b1_act1(self.b1_bn1(self.b1_conv1(x_trans)))
         b1_c2 = self.b1_act2(self.b1_bn2(self.b1_conv2(b1_c1)))
-        b1_c2_trans = b1_c2.transpose(1, 2)  # (B, T, 64)
-        b1_lstm_out, _ = self.b1_lstm(b1_c2_trans)  # (B, T, 64)
-        b1_last = b1_lstm_out[:, -1, :]  # (B, 64)
-        b1_gap  = torch.mean(b1_lstm_out, dim=1)  # (B, 64)
-        b1_out  = torch.cat([b1_last, b1_gap], dim=-1)  # (B, 128)
+        b1_c2_trans = b1_c2.transpose(1, 2)  # (B, T, 32)
+        b1_lstm_out, _ = self.b1_lstm(b1_c2_trans)  # (B, T, 32)
+        b1_last = b1_lstm_out[:, -1, :]  # (B, 32)
+        b1_gap  = torch.mean(b1_lstm_out, dim=1)  # (B, 32)
+        b1_out  = torch.cat([b1_last, b1_gap], dim=-1)  # (B, 64)
 
         # ── Branch 2: Mid-Term (50% Slice) Conv1D ───────────────────────────
         half = max(1, t // 2)
         x_mid_trans = x_trans[:, :, -half:]
         b2_c = self.b2_act(self.b2_bn(self.b2_conv(x_mid_trans)))
-        b2_gap = torch.mean(b2_c, dim=-1)  # (B, 64)
-        b2_out = torch.relu(self.b2_fc(b2_gap))  # (B, 64)
+        b2_gap = torch.mean(b2_c, dim=-1)  # (B, 32)
+        b2_out = torch.relu(self.b2_fc(b2_gap))  # (B, 32)
 
         # ── Branch 3: Short-Term (30% Slice) Conv1D ──────────────────────────
         recent = max(1, int(t * 0.3))
         x_rec_trans = x_trans[:, :, -recent:]
         b3_c = self.b3_act(self.b3_bn(self.b3_conv(x_rec_trans)))
-        b3_gap = torch.mean(b3_c, dim=-1)  # (B, 64)
-        b3_out = torch.relu(self.b3_fc(b3_gap))  # (B, 64)
+        b3_gap = torch.mean(b3_c, dim=-1)  # (B, 32)
+        b3_out = torch.relu(self.b3_fc(b3_gap))  # (B, 32)
 
         # ── Auxiliary Supervision & StopGradient Detaching ───────────────────
         aux1 = self.aux1_head(b1_out.detach())
@@ -598,15 +606,20 @@ class SignalMetaNetwork(nn.Module):
         aux1_sg = aux1.detach()
         aux2_sg = aux2.detach()
 
-        # ── Gated Ensemble Fusion Layer ──────────────────────────────────────
+        # ── Gated Ensemble Fusion Layer (2-layer deep) ───────────────────────
+        # Layer 1: project concatenated branch+aux context into hidden space
         fusion_in = torch.cat([b1_out, b2_out, b3_out, aux1_sg, aux2_sg], dim=-1)
         feat = self.fusion_act(self.fusion_ln(self.fusion_fc(fusion_in)))
+        # Layer 2: deepen the joint embedding (q+strength losses drive learning here)
+        feat = self.fusion_act2(self.fusion_ln2(self.fusion_fc2(feat)))
 
         q_vals   = self.q_head(feat)
         strength = self.strength_head(feat)
+        # Fusion selector: raw logits for optimal horizon index (used in train_step only)
+        selector_logits = self.fusion_selector(feat)
 
         # ── Private-projection auxiliary heads (Zero Gradient Interference) ─
-        branch_cat = self.branch_ln(torch.cat([b1_out, b2_out, b3_out], dim=-1).detach())  # (B, 256)
+        branch_cat = self.branch_ln(torch.cat([b1_out, b2_out, b3_out], dim=-1).detach())  # (B, 128)
 
         pips      = self.pips_head(self.pips_ln(self.pips_proj(branch_cat)))
         risk      = self.risk_head(self.risk_ln(self.risk_proj(branch_cat)))
@@ -614,7 +627,7 @@ class SignalMetaNetwork(nn.Module):
         reversal  = self.reversal_head(self.rev_ln(self.rev_proj(branch_cat)))
 
         if return_aux:
-            return q_vals, strength, pips, risk, liquidity, reversal, aux1, aux2
+            return q_vals, strength, pips, risk, liquidity, reversal, aux1, aux2, selector_logits
         return q_vals, strength, pips, risk, liquidity, reversal
 
 
@@ -830,7 +843,7 @@ class OnlineSignalMetaLearner:
         reversal_prob = batch['reversal_prob']
         weights_t = torch.tensor(weights, dtype=torch.float32)
 
-        q_vals, strength_pred, pips_pred, risk_pred, liquidity_pred, reversal_pred, aux1, aux2 = self.net(states, return_aux=True)
+        q_vals, strength_pred, pips_pred, risk_pred, liquidity_pred, reversal_pred, aux1, aux2, selector_logits = self.net(states, return_aux=True)
         with torch.no_grad():
             next_q_vals, _, _, _, _, _ = self.target_net(next_states)
             max_next_q, _ = torch.max(next_q_vals, dim=1)
@@ -879,7 +892,14 @@ class OnlineSignalMetaLearner:
         loss_aux1 = torch.mean(weights_t * nn.functional.smooth_l1_loss(aux1, target_aux, reduction='none').mean(dim=1))
         loss_aux2 = torch.mean(weights_t * nn.functional.smooth_l1_loss(aux2, target_aux, reduction='none').mean(dim=1))
 
-        # Balanced Total Loss: raised weights for pips/risk/reversal to match Keras capacity
+        # Fusion Selector Loss: CrossEntropy on the optimal horizon index (0-3).
+        # Target = argmax of strength_pred (detached) — the horizon the model currently
+        # rates highest. Selector loss trains the fusion to be self-consistent about which
+        # output head it is routing to, forcing its neurons to be jointly aware of all heads.
+        best_horizon_idx = strength_pred.detach().argmax(dim=1).long()
+        loss_selector = nn.functional.cross_entropy(selector_logits, best_horizon_idx)
+
+        # Balanced Total Loss
         total_loss = (
             loss_q
             + loss_strength
@@ -889,6 +909,7 @@ class OnlineSignalMetaLearner:
             + 0.3 * loss_reversal
             + 0.15 * loss_aux1
             + 0.15 * loss_aux2
+            + 0.3 * loss_selector   # fusion routing supervision
         )
 
         self.optimizer.zero_grad()

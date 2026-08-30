@@ -92,34 +92,34 @@ class ExecutorQNetwork(nn.Module):
     - Gated Ensemble Fusion Head: Combines b1_out, b2_out, aux1_detached, aux2_detached for robust Q-value estimation.
     """
 
-    def __init__(self, input_dim: int = EXECUTOR_STATE_DIM, hidden_dim: int = 128, num_actions: int = NUM_ACTIONS):
+    def __init__(self, input_dim: int = EXECUTOR_STATE_DIM, hidden_dim: int = 64, num_actions: int = NUM_ACTIONS):
         super().__init__()
-        # Branch 1: Dense Feature Extraction Tower
+        # Branch 1: Dense Feature Extraction Tower (Halved)
         self.b1_fc1 = nn.Linear(input_dim, hidden_dim)
         self.b1_ln1 = nn.LayerNorm(hidden_dim)
         self.b1_act1 = nn.SiLU()
-        self.b1_drop = nn.Dropout(0.0)  # Disabled dropout for Q-learning stability
-        self.b1_fc2 = nn.Linear(hidden_dim, 64)
-        self.b1_ln2 = nn.LayerNorm(64)
+        self.b1_drop = nn.Dropout(0.0)
+        self.b1_fc2 = nn.Linear(hidden_dim, 32)
+        self.b1_ln2 = nn.LayerNorm(32)
         self.b1_act2 = nn.SiLU()
 
-        # Branch 2: Multi-Scale Grouped Feature Tower
+        # Branch 2: Multi-Scale Grouped Feature Tower (Halved)
         # Slice inputs into 4 semantic sub-groups: Meta (10), Risk (5), Zone (8), Time (5)
-        self.b2_meta = nn.Linear(10, 32)
-        self.b2_risk = nn.Linear(5, 32)
-        self.b2_zone = nn.Linear(8, 32)
-        self.b2_time = nn.Linear(5, 32)
-        self.b2_fusion = nn.Linear(128, 64)
-        self.b2_ln = nn.LayerNorm(64)
+        self.b2_meta = nn.Linear(10, 16)
+        self.b2_risk = nn.Linear(5, 16)
+        self.b2_zone = nn.Linear(8, 16)
+        self.b2_time = nn.Linear(5, 16)
+        self.b2_fusion = nn.Linear(64, 32)
+        self.b2_ln = nn.LayerNorm(32)
         self.b2_act = nn.SiLU()
 
-        # Auxiliary Supervised Heads (1 per branch)
-        self.aux1_head = nn.Linear(64, num_actions)
-        self.aux2_head = nn.Linear(64, num_actions)
+        # Auxiliary Supervised Heads (1 per branch, Halved)
+        self.aux1_head = nn.Linear(32, num_actions)
+        self.aux2_head = nn.Linear(32, num_actions)
 
-        # Gated Ensemble Fusion Head
-        # Inputs: b1_out (64) + b2_out (64) + aux1_detached (5) + aux2_detached (5) = 138
-        self.fusion_fc1 = nn.Linear(64 + 64 + num_actions + num_actions, hidden_dim)
+        # Gated Ensemble Fusion Head (Halved)
+        # Inputs: b1_out (32) + b2_out (32) + aux1_detached (4) + aux2_detached (4) = 72
+        self.fusion_fc1 = nn.Linear(32 + 32 + num_actions + num_actions, hidden_dim)
         self.fusion_ln1 = nn.LayerNorm(hidden_dim)
         self.fusion_act1 = nn.SiLU()
         self.fusion_out = nn.Linear(hidden_dim, num_actions)
