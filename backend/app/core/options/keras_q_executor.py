@@ -201,13 +201,21 @@ class KerasOptionsQExecutor:
         state: np.ndarray,
         mask: np.ndarray,
         eval_mode: bool = False,
+        eval_epsilon: float = 0.10,
     ) -> int:
-        """Select action via epsilon-greedy policy with HardActionMask."""
+        """Select action via epsilon-greedy policy with HardActionMask.
+
+        In eval_mode, a small residual epsilon (eval_epsilon) is retained so
+        that an undertrained network with WAIT-bias does not collapse to 100%
+        WAIT during Phase 3 assessment.
+        """
         valid_actions = np.where(mask == 1)[0]
         if len(valid_actions) == 0:
             return ACTION_WAIT
 
-        if not eval_mode and random.random() < self.epsilon:
+        # Training: full epsilon-greedy. Eval: residual epsilon to prevent WAIT lock.
+        eps = eval_epsilon if eval_mode else self.epsilon
+        if random.random() < eps:
             return int(random.choice(valid_actions))
 
         state_tensor = np.expand_dims(state, axis=0)

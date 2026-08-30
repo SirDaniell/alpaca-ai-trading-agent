@@ -1,50 +1,26 @@
-# Signal Intelligence Backend
+# Signal Intelligence & Options RL Execution Backend
 
-This backend is a signal-intelligence and meta-learning stack for market data analysis. Its current responsibility is to consume data, enrich it with technical and structural features, generate candidate signals, classify those signals, and learn which patterns are worth carrying forward for future trading logic.
+This backend is an autonomous options trading agent and reinforcement learning engine built for the **Alpaca AI Trading Agents Hackathon**.
 
-The active path today is synthetic-data-first development. The system is designed to be validated on generated and curated market datasets while the data pipeline, learning loop, and signal classification stack mature. This project is not currently organized around live Alpaca brokerage execution or MCP orchestration as its primary operational path.
+It features a **Two-Tier Reinforcement Learning Pipeline**:
+1. **Tier 1 — Signal Meta-Learner**: Higher-timeframe (HTF) market bias, multi-horizon label scoring, and 6 decoupled auxiliary regression heads.
+2. **Phase 1b — Meta-Learner Inference Pass**: Sequential, causal pass generating 10,000 high-conviction transition memories.
+3. **Tier 2 — Dual-Branch Ensemble Options Q-Executor**: Lower-timeframe (LTF) trade execution with 1:1 functional parity across PyTorch (`q_executor.py`) and Keras (`keras_q_executor.py`).
+4. **Hard Action Masking & Dynamic SNR**: Strict zero-lookahead support/resistance tracking with buyer/seller volume delta fallback.
 
-## What this backend does
+---
 
-The backend is structured around a staged learning pipeline:
+## Benchmark Evaluation Scripts
 
-1. **Data consumption**
-   - Load raw market or synthetic sessions
-   - Normalize candles, sessions, and metadata
-   - Track dataset lineage and experimentation context
+Run walk-forward out-of-sample options benchmarks across 40,000 historical bars:
 
-2. **Data enrichment**
-   - Compute indicators and feature sets
-   - Clean and structure signal-relevant context
-   - Build enriched market-state inputs for learning
+```bash
+# PyTorch 40k-bar Evaluation
+PYTHONPATH=. python3 scripts/evaluate_option_expiries.py --symbols SPY --framework pytorch --limit 40000
 
-3. **Signal production**
-   - Detect trend, divergence, exhaustion, and structural events
-   - Assemble signal bundles from multi-timeframe and pattern analysis
-   - Produce candidate trade ideas from real or synthetic market conditions
-
-4. **Signal classification**
-   - Use the meta learner to evaluate signal quality
-   - Attach reward, confidence, and behavioral labels to candidates
-   - Classify signals as actionable, invalid, noisy, or exploratory
-
-5. **Future policy layer**
-   - The next layer is a Q-learner or policy-driven trade system
-   - That layer will consume the classified signal state after validation
-   - It is intentionally downstream from the current signal intelligence stack
-
-The meta learner is the current decision-making core: it consumes data, enriches it, produces signals, and classifies them before any future Q-learner trade layer is introduced.
-
-## Current active path
-
-This project is intentionally synthetic-data-first for now:
-
-- Synthetic datasets are the default validation path
-- Generated and curated market sessions drive learning and testing
-- Model validation happens in a controlled, reproducible environment
-- Live execution and brokerage integration remain deferred until the learning stack is mature
-
-This makes the backend a research and signal-validation engine rather than a live trading bot.
+# Keras 40k-bar Evaluation
+PYTHONPATH=. python3 scripts/evaluate_option_expiries.py --symbols SPY --framework keras --limit 40000
+```
 
 ## Execution model
 

@@ -469,7 +469,7 @@ class SignalMetaNetwork(nn.Module):
         self.b1_fc1 = nn.Linear(input_dim, hidden_dim)
         self.b1_ln1 = nn.LayerNorm(hidden_dim)
         self.b1_act1 = nn.SiLU()
-        self.b1_drop = nn.Dropout(0.2)
+        self.b1_drop = nn.Dropout(0.0)  # Disabled dropout for regression convergence
         self.b1_fc2 = nn.Linear(hidden_dim, 128)
         self.b1_ln2 = nn.LayerNorm(128)
         self.b1_act2 = nn.SiLU()
@@ -567,6 +567,8 @@ class SignalMetaNetwork(nn.Module):
         b2_out = self.b2_act(self.b2_ln(self.b2_fusion(b2_cat)))
 
         # ── Auxiliary Supervision & StopGradient Detaching ───────────────────
+        # Detach b1_out and b2_out so auxiliary losses update ONLY private aux head parameters
+        # and NEVER corrupt shared trunk representations (matching tt.py solo head isolation)
         aux1 = self.aux1_head(b1_out.detach())
         aux2 = self.aux2_head(b2_out.detach())
 

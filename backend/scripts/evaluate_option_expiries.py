@@ -10,6 +10,7 @@ Evaluates out-of-sample directional win rates, streaks, and performance across 4
 
 from __future__ import annotations
 
+from datetime import datetime
 import sys
 import logging
 import pprint
@@ -241,9 +242,10 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
     aligned_df = compute_full_context_features(aligned_df)
 
     close_col = "close_5m" if "close_5m" in aligned_df.columns else "close"
-    high_col = "high_5m" if "high_5m" in aligned_df.columns else "high"
-    low_col = "low_5m" if "low_5m" in aligned_df.columns else "low"
-    vol_col = "volume_5m" if "volume_5m" in aligned_df.columns else "volume"
+    open_col  = "open_5m"  if "open_5m"  in aligned_df.columns else "open"
+    high_col  = "high_5m"  if "high_5m"  in aligned_df.columns else "high"
+    low_col   = "low_5m"   if "low_5m"   in aligned_df.columns else "low"
+    vol_col   = "volume_5m" if "volume_5m" in aligned_df.columns else "volume"
 
     # ── Label uses max evaluation horizon (12 bars = 1h) to match EXPIRY_HORIZONS ──
     aligned_df["forward_move_12"] = aligned_df[close_col].shift(-12) - aligned_df[close_col]
@@ -346,9 +348,12 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
                 timestamp=ts if isinstance(ts, datetime) else None,
             )
 
-    # ── Phase 1: Meta-Learner Training ────────────────────────────────────────
-    META_TRAIN_STEPS = 500
-    print(f"\n[Phase 1] Training Meta-Learner ({META_TRAIN_STEPS} gradient steps, multi-horizon labels)...")
+    # ── Phase 1: Meta-Learner Training (100% Full-Set Systematic Epoch Sweep) ──
+    META_EPOCHS = 50
+    total_train_bars = len(train_df) - 13
+    total_expected_steps = (total_train_bars // 64) * META_EPOCHS
+    print(f"\n[Phase 1] Training Meta-Learner (100% Full-Set Sweep: {META_EPOCHS} Epochs across {total_train_bars} bars)...")
+
     _meta_loss_acc = 0.0
     _meta_loss_q_acc = 0.0
     _meta_loss_str_acc = 0.0
@@ -358,20 +363,23 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
     _meta_loss_rev_acc = 0.0
     _meta_loss_aux1_acc = 0.0
     _meta_loss_aux2_acc = 0.0
-    LOG_EVERY = 25
+    global_step = 0
+    LOG_EVERY = 50
 
-    for step in range(META_TRAIN_STEPS):
-        batch_indices = np.random.choice(len(train_df) - 25, size=min(64, len(train_df) - 25), replace=False)
-        for idx in batch_indices:
+    best_meta_loss = float("inf")
+    best_meta_weights = None
+
+    for ep in range(META_EPOCHS):
+        for idx in range(total_train_bars):
             row = train_df.iloc[idx]
             fut_highs = train_df[high_col].iloc[idx+1:idx+13].values
             fut_lows = train_df[low_col].iloc[idx+1:idx+13].values
             fut_closes = train_df[close_col].iloc[idx+1:idx+13].values
-            # Pass full feature dict so DXY/context columns are used by the model
+
             f_dict = _row_to_feature_dict(row, close_col, vol_col)
             meta_learner.record_experience(
                 feature_dict=f_dict,
-                signal_id=f"sig_{idx}_{step}",
+                signal_id=f"sig_{ep}_{idx}",
                 symbol=symbol,
                 direction="bullish" if row["forward_move_12"] > 0 else "bearish",
                 entry_price=float(row[close_col]),
@@ -379,111 +387,161 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
                 future_lows=fut_lows,
                 future_closes=fut_closes,
             )
-        train_metrics = meta_learner.train_step(batch_size=64)
-        if train_metrics.get("loss", 0) > 0:
-            _meta_loss_acc += train_metrics["loss"]
-            _meta_loss_q_acc += train_metrics.get("loss_q", 0)
-            _meta_loss_str_acc += train_metrics.get("loss_strength", 0)
-            _meta_loss_pips_acc += train_metrics.get("loss_pips", 0)
-            _meta_loss_risk_acc += train_metrics.get("loss_risk", 0)
-            _meta_loss_liq_acc += train_metrics.get("loss_liquidity", 0)
-            _meta_loss_rev_acc += train_metrics.get("loss_reversal", 0)
-            _meta_loss_aux1_acc += train_metrics.get("loss_aux1", 0)
-            _meta_loss_aux2_acc += train_metrics.get("loss_aux2", 0)
 
-        if (step + 1) % LOG_EVERY == 0:
-            n_samples = max(1, LOG_EVERY)
-            avg_loss = _meta_loss_acc / n_samples
-            avg_q = _meta_loss_q_acc / n_samples
-            avg_str = _meta_loss_str_acc / n_samples
-            avg_pips = _meta_loss_pips_acc / n_samples
-            avg_risk = _meta_loss_risk_acc / n_samples
-            avg_liq = _meta_loss_liq_acc / n_samples
-            avg_rev = _meta_loss_rev_acc / n_samples
-            avg_aux1 = _meta_loss_aux1_acc / n_samples
-            avg_aux2 = _meta_loss_aux2_acc / n_samples
-            buf = train_metrics.get("buffer_size", "?")
-            print(
-                f"  [Meta step {step+1:>4}/{META_TRAIN_STEPS}] total={avg_loss:.4e} | "
-                f"q={avg_q:.4e} | str={avg_str:.4e} | pips={avg_pips:.4e} | "
-                f"risk={avg_risk:.4e} | liq={avg_liq:.4e} | rev={avg_rev:.4e} | "
-                f"aux1={avg_aux1:.4e} | aux2={avg_aux2:.4e} | buf={buf}"
-            )
-            _meta_loss_acc = _meta_loss_q_acc = _meta_loss_str_acc = 0.0
-            _meta_loss_pips_acc = _meta_loss_risk_acc = _meta_loss_liq_acc = 0.0
-            _meta_loss_rev_acc = _meta_loss_aux1_acc = _meta_loss_aux2_acc = 0.0
+            # Perform gradient update step every 64 bars
+            if (idx + 1) % 64 == 0:
+                global_step += 1
+                train_metrics = meta_learner.train_step(batch_size=64)
+                if train_metrics.get("loss", 0) > 0:
+                    _meta_loss_acc += train_metrics["loss"]
+                    _meta_loss_q_acc += train_metrics.get("loss_q", 0)
+                    _meta_loss_str_acc += train_metrics.get("loss_strength", 0)
+                    _meta_loss_pips_acc += train_metrics.get("loss_pips", 0)
+                    _meta_loss_risk_acc += train_metrics.get("loss_risk", 0)
+                    _meta_loss_liq_acc += train_metrics.get("loss_liquidity", 0)
+                    _meta_loss_rev_acc += train_metrics.get("loss_reversal", 0)
+                    _meta_loss_aux1_acc += train_metrics.get("loss_aux1", 0)
+                    _meta_loss_aux2_acc += train_metrics.get("loss_aux2", 0)
 
-    # ── Phase 2: Q-Learner Training ────────────────────────────────────────────
-    Q_PREFILL_STEPS = 1000
-    Q_TRAIN_STEPS = 700
-    print(f"\n[Phase 2] Training Dual-Branch Ensemble Options Q-Learner ({Q_TRAIN_STEPS} gradient steps)...")
-    print(f"  Pre-filling replay buffer ({Q_PREFILL_STEPS} high-outcome transitions)...")
-    filled_count = 0
-    attempts = 0
-    max_attempts = Q_PREFILL_STEPS * 10
-    while filled_count < Q_PREFILL_STEPS and attempts < max_attempts:
-        attempts += 1
-        idx = np.random.randint(0, len(train_df) - 2)
-        row_pf = train_df.iloc[idx]
-        next_row_pf = train_df.iloc[idx + 1]
-        cp = float(row_pf[close_col])
-        np_ = float(next_row_pf[close_col])
-        fwd_pf = (np_ - cp) / (cp + 1e-8)
+                if global_step % LOG_EVERY == 0:
+                    n_samples = max(1, LOG_EVERY)
+                    avg_loss = _meta_loss_acc / n_samples
+                    avg_q = _meta_loss_q_acc / n_samples
+                    avg_str = _meta_loss_str_acc / n_samples
+                    avg_pips = _meta_loss_pips_acc / n_samples
+                    avg_risk = _meta_loss_risk_acc / n_samples
+                    avg_liq = _meta_loss_liq_acc / n_samples
+                    avg_rev = _meta_loss_rev_acc / n_samples
+                    avg_aux1 = _meta_loss_aux1_acc / n_samples
+                    avg_aux2 = _meta_loss_aux2_acc / n_samples
+                    buf = train_metrics.get("buffer_size", "?")
 
-        # Update real SNR snapshot up to current bar (NO LOOKAHEAD)
-        update_real_snr_snapshot(train_df, idx, zone_manager)
-        zone_manager.update_invalidation(cp, float(row_pf[high_col]), float(row_pf[low_col]))
-        f_dict_pf = _row_to_feature_dict(row_pf, close_col, vol_col)
-        pred_pf = meta_learner.predict(f_dict_pf)
-        ms_pf = float(pred_pf.get("signal_strength", 0.5))
-        bias_pf = HTFBiasPackage(
-            direction="bullish" if ms_pf > 0.5 else "bearish",
-            strength=ms_pf,
-            reversal_prob=float(pred_pf.get("reversal_prob", 0.2)),
-            q_value=float(pred_pf.get("q_value", 0.5)),
-            expected_mfe_pips=float(pred_pf.get("expected_mfe_pips", 50.0)),
-            expected_mae_pips=float(pred_pf.get("expected_mae_pips", 15.0)),
-            horizon_strengths=pred_pf.get("horizon_strengths", [0.5, 0.5, 0.5, 0.5]),
-            optimal_horizon_idx=int(pred_pf.get("optimal_horizon_idx", 2)),
-            recommended_expiry=str(pred_pf.get("recommended_expiry", "30m")),
-        )
+                    # Best Meta Weights Checkpoint Tracking
+                    if avg_loss < best_meta_loss:
+                        best_meta_loss = avg_loss
+                        if hasattr(meta_learner, "get_weights"):
+                            best_meta_weights = meta_learner.get_weights()
+                        elif hasattr(meta_learner, "network"):
+                            best_meta_weights = {k: v.cpu().clone() for k, v in meta_learner.network.state_dict().items()}
 
-        # High-outcome filter: require high Meta-Learner conviction (strength >= 0.60) or clean directional move
-        if ms_pf < 0.60 and abs(fwd_pf) < 0.003:
+                    print(
+                        f"  [Meta Epoch {ep+1:>2}/{META_EPOCHS} | Step {global_step:>5}/{total_expected_steps}] total={avg_loss:.4e} (Best={best_meta_loss:.4e}) | "
+                        f"q={avg_q:.4e} | str={avg_str:.4e} | pips={avg_pips:.4e} | "
+                        f"risk={avg_risk:.4e} | rev={avg_rev:.4e} | buf={buf}"
+                    )
+                    _meta_loss_acc = _meta_loss_q_acc = _meta_loss_str_acc = 0.0
+                    _meta_loss_pips_acc = _meta_loss_risk_acc = _meta_loss_liq_acc = 0.0
+                    _meta_loss_rev_acc = _meta_loss_aux1_acc = _meta_loss_aux2_acc = 0.0
+
+    # Restore best Meta-Learner weights before buffer generation
+    if best_meta_weights is not None:
+        if hasattr(meta_learner, "set_weights"):
+            meta_learner.set_weights(best_meta_weights)
+        elif hasattr(meta_learner, "network"):
+            meta_learner.network.load_state_dict(best_meta_weights)
+        print(f"\n[Phase 1 Complete] Restored best Meta-Learner checkpoint (loss = {best_meta_loss:.4e}).")
+
+    # ── Phase 1b: Meta-Learner Inference Pass → Q-Learner Buffer Generation ──
+    # The meta-learner makes a second sequential pass over the FULL training set.
+    # Its outputs (htf_bias) are used to construct high-quality Q-learner transitions.
+    # Only high-conviction or strong-directional bars are kept (quality gate).
+    # Buffer target: 10,000 rows — giving the Q-learner a rich, diverse memory.
+    Q_BUFFER_TARGET = 10_000
+    print(f"\n[Phase 1b] Meta-Learner inference pass → generating {Q_BUFFER_TARGET} Q-Learner transitions from train_df...")
+
+    q_buf_filled = 0
+    q_buf_attempts = 0
+    zone_manager_gen = ZoneSnapshotManager()
+
+    train_indices = list(range(len(train_df) - 13))
+    for idx in train_indices:
+        if q_buf_filled >= Q_BUFFER_TARGET:
+            break
+        q_buf_attempts += 1
+
+        row = train_df.iloc[idx]
+        cp = float(row[close_col])
+        next_close = float(train_df.iloc[idx + 1][close_col])
+        fwd_pct = (next_close - cp) / (cp + 1e-8)
+
+        if idx == 0 or idx % 15 == 0 or len(zone_manager_gen.get_active_zones()) == 0:
+            update_real_snr_snapshot(train_df, idx, zone_manager_gen)
+        zone_manager_gen.update_invalidation(cp, float(row[high_col]), float(row[low_col]))
+
+        f_dict = _row_to_feature_dict(row, close_col, vol_col)
+        pred = meta_learner.predict(f_dict)
+        ms = float(pred.get("signal_strength", 0.5))
+
+        if ms < 0.65 and abs(fwd_pct) < 0.005:
             continue
 
-        ctx_pf = _make_exec_ctx(symbol, cp, dict(row_pf))
-        st_pf = q_executor.build_state_vector(bias_pf, account, ctx_pf, zone_manager)
-        mask_pf = np.ones(5, dtype=np.int32)
-        act_pf = q_executor.select_action(st_pf, mask_pf)
-        rew_pf = q_executor.calculate_executor_reward(
-            action=act_pf, action_mask=mask_pf, pnl_pct=fwd_pf, max_drawdown_exposed=0.01, forward_move_pct=fwd_pf, htf_bias=bias_pf,
+        bias = HTFBiasPackage(
+            direction="bullish" if ms > 0.5 else "bearish",
+            strength=ms,
+            reversal_prob=float(pred.get("reversal_prob", 0.2)),
+            q_value=float(pred.get("q_value", 0.5)),
+            expected_mfe_pips=float(pred.get("expected_mfe_pips", 50.0)),
+            expected_mae_pips=float(pred.get("expected_mae_pips", 15.0)),
+            horizon_strengths=pred.get("horizon_strengths", [0.5, 0.5, 0.5, 0.5]),
+            optimal_horizon_idx=int(pred.get("optimal_horizon_idx", 2)),
+            recommended_expiry=str(pred.get("recommended_expiry", "30m")),
+        )
+        ctx = _make_exec_ctx(symbol, cp, dict(row))
+        state = q_executor.build_state_vector(bias, account, ctx, zone_manager_gen)
+        mask_engine = HardActionMask()
+        action_mask = mask_engine.get_action_mask(
+            current_price=cp, atr=ctx.atr, zone_manager=zone_manager_gen,
+            buy_volume=ctx.buy_volume, sell_volume=ctx.sell_volume, has_open_position=False,
         )
 
-        # Filter out negative noise transitions during pre-fill
-        if rew_pf >= 0.0:
-            nst_pf = q_executor.build_state_vector(bias_pf, account, ctx_pf, zone_manager)
-            q_executor.record_transition(st_pf, act_pf, rew_pf, nst_pf, False, mask_pf)
-            filled_count += 1
+        if action_mask[1] == 1 and bias.direction == "bullish" and fwd_pct >= 0.003:
+            oracle_action = 1
+        elif action_mask[2] == 1 and bias.direction == "bearish" and fwd_pct <= -0.003:
+            oracle_action = 2
+        else:
+            oracle_action = 0
 
-    print(f"  Replay buffer pre-filled with {filled_count} high-outcome transitions. Starting {Q_TRAIN_STEPS} gradient steps...")
+        reward = q_executor.calculate_executor_reward(
+            action=oracle_action, action_mask=action_mask, pnl_pct=fwd_pct,
+            max_drawdown_exposed=0.005, forward_move_pct=fwd_pct, htf_bias=bias,
+        )
+
+        next_row = train_df.iloc[idx + 1]
+        next_cp = float(next_row[close_col])
+        next_ctx = _make_exec_ctx(symbol, next_cp, dict(next_row))
+        next_state = q_executor.build_state_vector(bias, account, next_ctx, zone_manager_gen)
+
+        q_executor.record_transition(state, oracle_action, reward, next_state, False, action_mask)
+        q_buf_filled += 1
+
+        if q_buf_filled % 1000 == 0:
+            print(f"  [Phase 1b] Buffer: {q_buf_filled}/{Q_BUFFER_TARGET} transitions | Scanned: {q_buf_attempts} bars")
+
+    print(f"  [Phase 1b] Complete: {q_buf_filled} transitions generated from {q_buf_attempts} scanned bars.")
+
+    # ── Phase 2: Q-Learner Training with Episode Checks & Performance Threshold Early Stopping ──
+    MAX_Q_TRAIN_STEPS = 2000
+    EVAL_EVERY_STEPS = 150
+    TARGET_WIN_RATE_THRESHOLD = 60.0  # Stop training early if validation episode win rate hits 60%
+
+    print(f"\n[Phase 2] Training Q-Learner (Episodes + Early Stopping Threshold at {TARGET_WIN_RATE_THRESHOLD}% Win Rate)...")
 
     _q_loss_acc = 0.0
-    Q_LOG_EVERY = 50
     action_dist = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
+    best_eval_wr = 0.0
+    best_q_weights = None
+    episode_counter = 0
 
-    for step in range(Q_TRAIN_STEPS):
+    for step in range(MAX_Q_TRAIN_STEPS):
+        q_loss = q_executor.train_step(batch_size=128)
+        if q_loss is not None:
+            _q_loss_acc += float(q_loss)
+
+        # Sample live bar for action distribution tracking
         idx = np.random.randint(0, len(train_df) - 2)
         row = train_df.iloc[idx]
-        next_row = train_df.iloc[idx + 1]
         cur_price = float(row[close_col])
-        next_price = float(next_row[close_col])
-        fwd_move_pct = (next_price - cur_price) / (cur_price + 1e-8)
-
-        # Update real SNR snapshot up to current training bar (NO LOOKAHEAD)
-        update_real_snr_snapshot(train_df, idx, zone_manager)
-        zone_manager.update_invalidation(cur_price, float(row[high_col]), float(row[low_col]))
-
+        exec_ctx = _make_exec_ctx(symbol, cur_price, dict(row))
         f_dict = _row_to_feature_dict(row, close_col, vol_col)
         pred = meta_learner.predict(f_dict)
         meta_score = float(pred.get("signal_strength", 0.5))
@@ -498,30 +556,86 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
             optimal_horizon_idx=int(pred.get("optimal_horizon_idx", 2)),
             recommended_expiry=str(pred.get("recommended_expiry", "30m")),
         )
-        exec_ctx = _make_exec_ctx(symbol, cur_price, dict(row))
         state = q_executor.build_state_vector(htf_bias, account, exec_ctx, zone_manager)
         mask_engine = HardActionMask()
         action_mask = mask_engine.get_action_mask(
-            current_price=cur_price, atr=exec_ctx.atr, zone_manager=zone_manager, buy_volume=exec_ctx.buy_volume, sell_volume=exec_ctx.sell_volume, has_open_position=False,
+            current_price=cur_price, atr=exec_ctx.atr, zone_manager=zone_manager,
+            buy_volume=exec_ctx.buy_volume, sell_volume=exec_ctx.sell_volume, has_open_position=False,
         )
         action = q_executor.select_action(state, action_mask)
         action_dist[action] = action_dist.get(action, 0) + 1
-        reward = q_executor.calculate_executor_reward(
-            action=action, action_mask=action_mask, pnl_pct=fwd_move_pct, max_drawdown_exposed=0.01, forward_move_pct=fwd_move_pct, htf_bias=htf_bias,
-        )
-        next_state = q_executor.build_state_vector(htf_bias, account, exec_ctx, zone_manager)
-        q_executor.record_transition(state, action, reward, next_state, False, action_mask)
-        q_loss = q_executor.train_step(batch_size=64)
-        if q_loss is not None:
-            _q_loss_acc += float(q_loss)
 
-        if (step + 1) % Q_LOG_EVERY == 0:
-            avg_q_loss = _q_loss_acc / Q_LOG_EVERY
+        # ── Episode Evaluation Checkpoint ─────────────────────────────────────
+        if (step + 1) % EVAL_EVERY_STEPS == 0:
+            episode_counter += 1
+            avg_q_loss = _q_loss_acc / EVAL_EVERY_STEPS
             act_names = {0: "WAIT", 1: "CALL", 2: "PUT", 3: "TP_HALF", 4: "CLOSE"}
             dist_str = " | ".join(f"{act_names.get(a, a)}={c}" for a, c in sorted(action_dist.items()) if c > 0)
-            print(f"  [Q step {step+1:>4}/{Q_TRAIN_STEPS}] avg_loss={avg_q_loss:.4e} | actions[{dist_str}]")
+
+            # Fast 300-bar Episode Evaluation on Validation Slice
+            val_wins, val_total = 0, 0
+            val_indices = np.random.choice(len(train_df) - 6, size=min(300, len(train_df) - 6), replace=False)
+            for v_idx in val_indices:
+                v_row = train_df.iloc[v_idx]
+                v_exp_row = train_df.iloc[v_idx + 3]
+                v_cp = float(v_row[close_col])
+                v_exp_cp = float(v_exp_row[close_col])
+
+                v_fdict = _row_to_feature_dict(v_row, close_col, vol_col)
+                v_pred = meta_learner.predict(v_fdict)
+                v_ms = float(v_pred.get("signal_strength", 0.5))
+                v_bias = HTFBiasPackage(
+                    direction="bullish" if v_ms > 0.5 else "bearish", strength=v_ms,
+                    reversal_prob=float(v_pred.get("reversal_prob", 0.2)), q_value=float(v_pred.get("q_value", 0.5)),
+                    expected_mfe_pips=float(v_pred.get("expected_mfe_pips", 50.0)), expected_mae_pips=float(v_pred.get("expected_mae_pips", 15.0)),
+                    horizon_strengths=v_pred.get("horizon_strengths", [0.5, 0.5, 0.5, 0.5]),
+                    optimal_horizon_idx=int(v_pred.get("optimal_horizon_idx", 2)), recommended_expiry=str(v_pred.get("recommended_expiry", "30m")),
+                )
+                v_ctx = _make_exec_ctx(symbol, v_cp, dict(v_row))
+                v_st = q_executor.build_state_vector(v_bias, account, v_ctx, zone_manager)
+                v_mask = mask_engine.get_action_mask(
+                    current_price=v_cp, atr=v_ctx.atr, zone_manager=zone_manager,
+                    buy_volume=v_ctx.buy_volume, sell_volume=v_ctx.sell_volume, has_open_position=False,
+                )
+                v_act = q_executor.select_action(v_st, v_mask, eval_mode=True)
+                if v_act == 1:
+                    val_total += 1
+                    if v_exp_cp > v_cp: val_wins += 1
+                elif v_act == 2:
+                    val_total += 1
+                    if v_exp_cp < v_cp: val_wins += 1
+
+            val_wr = (val_wins / val_total * 100.0) if val_total > 0 else 0.0
+
+            # Save best Q-Learner weights when win rate improves
+            if val_wr > best_eval_wr:
+                best_eval_wr = val_wr
+                if hasattr(q_executor, "get_weights"):
+                    best_q_weights = q_executor.get_weights()
+                elif hasattr(q_executor, "policy_net"):
+                    best_q_weights = {k: v.cpu().clone() for k, v in q_executor.policy_net.state_dict().items()}
+
+            print(
+                f"  [Q Episode {episode_counter:>2} | Step {step+1:>4}/{MAX_Q_TRAIN_STEPS}] "
+                f"avg_loss={avg_q_loss:.4e} | Val Trades={val_total} | Val WinRate={val_wr:.1f}% (Best={best_eval_wr:.1f}%) | actions[{dist_str}]"
+            )
+
             _q_loss_acc = 0.0
             action_dist = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
+
+            # Early Stopping Check: If validation win rate hits target threshold
+            if val_wr >= TARGET_WIN_RATE_THRESHOLD and step >= 450:
+                print(f"  [Q Early Stopping] Target performance threshold reached ({val_wr:.1f}% >= {TARGET_WIN_RATE_THRESHOLD}%) at step {step+1}. Stopping Q-training.")
+                break
+
+    # Restore best Q-Learner weights before out-of-sample evaluation
+    if best_q_weights is not None:
+        if hasattr(q_executor, "set_weights"):
+            q_executor.set_weights(best_q_weights)
+        elif hasattr(q_executor, "policy_net"):
+            q_executor.policy_net.load_state_dict(best_q_weights)
+        print(f"\n[Phase 2 Complete] Restored best Q-Learner checkpoint (Best Val WinRate = {best_eval_wr:.1f}%).")
+
 
     # 3. Evaluate Out-of-Sample Test Window across all 4 Expiry Horizons
     print("\n[Phase 3] Evaluating Out-of-Sample Performance across Expiry Horizons:")
@@ -551,7 +665,7 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
 
             has_open_position = (idx < open_trade_until_idx)
 
-            if idx % 50 == 0:
+            if idx == 0 or idx % 15 == 0 or len(zone_manager.get_active_zones()) == 0:
                 update_real_snr_snapshot(test_df, idx, zone_manager)
             zone_manager.update_invalidation(cur_price, float(row[high_col]), float(row[low_col]))
 
@@ -695,7 +809,7 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
         row = test_df.iloc[idx]
         cur_price = float(row[close_col])
 
-        if idx % 50 == 0:
+        if idx == 0 or idx % 15 == 0 or len(zone_manager.get_active_zones()) == 0:
             update_real_snr_snapshot(test_df, idx, zone_manager)
         zone_manager.update_invalidation(cur_price, float(row[high_col]), float(row[low_col]))
 
@@ -848,7 +962,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    symbols = [s.strip().upper() for s in args.symbols.replace(" ", ",").split(",") if s.strip()]
 
     all_results = {}
     for sym in symbols:

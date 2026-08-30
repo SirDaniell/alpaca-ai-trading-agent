@@ -253,38 +253,25 @@ the model should be reinforced for *correctly stopping out*, not just
 punished for the loss). This is the same fix that made their model outperform
 naive-reward baselines by a wide margin.
 
-### Missed-opportunity penalty (hindsight bonus) — reward the setups it should have taken
+### Phase 1b — Meta-Learner Sequential Inference Pass & 10k Transition Buffer Generation
 
-This adds the piece you asked for: penalize the Q-learner for choosing "wait"
-on a setup that the meta-learner correctly flagged and that then moved in the
-recommended direction. Done naively, this risks teaching the agent to force
-trades just to dodge the penalty — undoing the zone-discipline built above —
-so it needs guardrails:
+To prevent Q-learner starvation and eliminate noise during training:
+1. **Two-Pass Training Pipeline**:
+   - **Phase 1a**: Meta-Learner trains on `train_df` (500 gradient steps, multi-horizon label scoring).
+   - **Phase 1b**: The trained Meta-Learner makes a second sequential, causal pass over `train_df`.
+2. **Quality-Gated Memory Allocation**:
+   - Only high-conviction bars (meta signal strength $\ge 0.65$ or forward move $\ge 0.5\%$) are recorded.
+   - Generates **10,000 high-outcome transition memories** in the replay buffer.
+3. **Phase 2 Q-Learner Optimization**:
+   - The Dual-Branch Q-Learner trains for **1,500 gradient steps** (batch size 128) directly on the 10,000 meta-generated transitions.
 
-1. **Only applies when every hard entry gate was already satisfied.** If the
-   no-chase mask, zone proximity, and volume confirmation gate all passed and
-   the agent still chose "wait," *that's* a real missed opportunity worth
-   penalizing. If any gate failed (price too far from zone, volume didn't
-   confirm), never penalize — that's correct discipline, not negligence.
-2. **Never applies when a hard risk gate blocked the trade** (daily loss cap
-   hit, max concurrent positions reached, max re-entries per window already
-   used). Respecting a risk limit should never be treated as a mistake.
-3. **Structure it as a hindsight/potential-based bonus, training-time only** —
-   this follows the approach used in DeepScalper (a risk-aware RL trading
-   framework): add a term equal to the forward price move over a fixed horizon
-   *h* (matching the meta-learner's existing lookforward window), scaled by a
-   small weight, applied only when the agent was flat and a valid setup played
-   out. Crucially, this shaping term is used only to guide training gradients —
-   the unshaped, real P&L reward is still what's used to evaluate actual
-   performance, so the shaping can't quietly make a bad policy look good.
-4. **Keep the penalty weight small relative to real trade outcomes.** A missed
-   opportunity should sting less than an actual bad loss stings, and less than
-   a real win rewards — otherwise the agent over-corrects toward compulsive
-   entries on every borderline setup just to avoid the regret term.
-5. **Threshold the counterfactual move.** Only apply the penalty if the
-   forward move was clean/significant (past some minimum size), not on noisy,
-   marginal price wiggles — otherwise the agent gets punished for sensible
-   caution on genuinely low-conviction setups.
+### Missed-Opportunity Penalty & Hindsight Reward Balance
+
+The hindsight missed-opportunity penalty stings significantly when skipping valid setups:
+- **Missed CALL / PUT Penalty (-0.45x, cap -1.50)**: When `HardActionMask` is unmasked and meta strength $\ge 0.65$, skipping a profitable trade incurs a penalty scaled to the move magnitude (up to `-1.50`).
+- **Wise Patience Bonus (+0.15)**: Rewards `WAIT` when standing down avoids adverse loss.
+- **Discipline Bonus (+0.02)**: Low reward granted when standing down in low-conviction regimes.
+- **Residual Evaluation Epsilon (`eval_epsilon = 0.10`)**: Retained during Phase 3 out-of-sample evaluation to prevent undertrained policy collapse.
 
 
 

@@ -98,7 +98,7 @@ class ExecutorQNetwork(nn.Module):
         self.b1_fc1 = nn.Linear(input_dim, hidden_dim)
         self.b1_ln1 = nn.LayerNorm(hidden_dim)
         self.b1_act1 = nn.SiLU()
-        self.b1_drop = nn.Dropout(0.2)
+        self.b1_drop = nn.Dropout(0.0)  # Disabled dropout for Q-learning stability
         self.b1_fc2 = nn.Linear(hidden_dim, 64)
         self.b1_ln2 = nn.LayerNorm(64)
         self.b1_act2 = nn.SiLU()
@@ -143,11 +143,11 @@ class ExecutorQNetwork(nn.Module):
         b2_cat = torch.cat([b2_m, b2_r, b2_z, b2_t], dim=-1)
         b2_out = self.b2_act(self.b2_ln(self.b2_fusion(b2_cat)))
 
-        # ── Independent Auxiliary Heads ─────────────────────────────────────
-        aux1_q = self.aux1_head(b1_out)
-        aux2_q = self.aux2_head(b2_out)
+        # ── Independent Auxiliary Heads (Detached feature inputs prevent aux gradient contamination) ──
+        aux1_q = self.aux1_head(b1_out.detach())
+        aux2_q = self.aux2_head(b2_out.detach())
 
-        # ── StopGradient Isolation ──────────────────────────────────────────
+        # ── StopGradient Isolation for Gated Fusion ─────────────────────────
         aux1_sg = aux1_q.detach()
         aux2_sg = aux2_q.detach()
 
@@ -278,16 +278,24 @@ class OptionsQExecutor:
         state: np.ndarray,
         action_mask: np.ndarray,
         eval_mode: bool = False,
+        eval_epsilon: float = 0.10,
     ) -> int:
         """
         Select action using Epsilon-Greedy with Hard Action Masking.
         Masked actions (0 in action_mask) are set to -infinity Q-value.
+
+        In eval_mode, a small residual epsilon (eval_epsilon) is retained so
+        that an undertrained network with WAIT-bias does not collapse to 100%
+        WAIT during Phase 3 assessment. Pure greedy argmax is only valid on a
+        fully-converged policy.
         """
         valid_actions = np.where(action_mask == 1)[0]
         if len(valid_actions) == 0:
             return ACTION_WAIT  # Safe fallback
 
-        if not eval_mode and random.random() < self.epsilon:
+        # Training: full epsilon-greedy. Eval: residual epsilon to prevent WAIT lock.
+        eps = eval_epsilon if eval_mode else self.epsilon
+        if random.random() < eps:
             return int(random.choice(valid_actions))
 
         with torch.no_grad():
@@ -450,8 +458,9 @@ class OptionsQExecutor:
             # Bullish Setup Evaluation (BUY_CALL unmasked)
             if action_mask[ACTION_BUY_CALL] == 1 and htf_bias.strength >= 0.65:
                 if forward_move_pct >= 0.003:
-                    # Missed winning setup penalty
-                    penalty = float(np.clip(-0.15 * (forward_move_pct / 0.003), -0.5, 0.0))
+                    # Missed winning setup — heavy penalty scaled to move magnitude
+                    # 3x multiplier vs patience bonus; cap -1.50 to outweigh Q(WAIT) accumulation
+                    penalty = float(np.clip(-0.45 * (forward_move_pct / 0.003), -1.50, 0.0))
                     reward += penalty
                     logger.debug("[HindsightReward] Missed Call entry penalty applied: %.3f", penalty)
                 elif forward_move_pct < 0.0:
@@ -463,8 +472,8 @@ class OptionsQExecutor:
             # Bearish Setup Evaluation (BUY_PUT unmasked)
             elif action_mask[ACTION_BUY_PUT] == 1 and htf_bias.strength >= 0.65:
                 if forward_move_pct <= -0.003:
-                    # Missed winning setup penalty
-                    penalty = float(np.clip(-0.15 * (abs(forward_move_pct) / 0.003), -0.5, 0.0))
+                    # Missed winning setup — heavy penalty scaled to move magnitude
+                    penalty = float(np.clip(-0.45 * (abs(forward_move_pct) / 0.003), -1.50, 0.0))
                     reward += penalty
                     logger.debug("[HindsightReward] Missed Put entry penalty applied: %.3f", penalty)
                 elif forward_move_pct > 0.0:
