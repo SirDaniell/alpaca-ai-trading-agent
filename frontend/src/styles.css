@@ -1,0 +1,229 @@
+@import "tailwindcss";
+@source "../src";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --radius-3xl: calc(var(--radius) + 12px);
+  --radius-4xl: calc(var(--radius) + 16px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-ring-offset-background: var(--background);
+  --color-gold: var(--gold);
+  --color-gold-foreground: var(--gold-foreground);
+  --color-silver: var(--silver);
+  --color-silver-foreground: var(--silver-foreground);
+  --color-bull: var(--bull);
+  --color-bear: var(--bear);
+  --color-glass: var(--glass);
+  --color-glass-border: var(--glass-border);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, monospace;
+  --shadow-glass: 0 1px 0 0 oklch(1 0 0 / 0.06) inset, 0 12px 32px -18px oklch(0 0 0 / 0.6);
+}
+
+:root {
+  --radius: 1rem;
+  --background: oklch(0.19 0.02 260);
+  --foreground: oklch(0.97 0.005 260);
+  --card: oklch(0.24 0.02 260 / 0.55);
+  --card-foreground: oklch(0.97 0.005 260);
+  --popover: oklch(0.22 0.02 260);
+  --popover-foreground: oklch(0.97 0.005 260);
+  --primary: oklch(0.62 0.17 253);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.3 0.02 260 / 0.6);
+  --secondary-foreground: oklch(0.95 0.005 260);
+  --muted: oklch(0.3 0.015 260 / 0.5);
+  --muted-foreground: oklch(0.72 0.015 260);
+  --accent: oklch(0.34 0.02 260 / 0.7);
+  --accent-foreground: oklch(0.97 0.005 260);
+  --destructive: oklch(0.58 0.21 22);
+  --destructive-foreground: oklch(0.99 0 0);
+  --border: oklch(1 0 0 / 0.1);
+  --input: oklch(1 0 0 / 0.12);
+  --ring: oklch(0.62 0.17 253);
+  --gold: oklch(0.79 0.13 85);
+  --gold-foreground: oklch(0.21 0.03 85);
+  --silver: oklch(0.82 0.01 260);
+  --silver-foreground: oklch(0.22 0.02 260);
+  --bull: oklch(0.75 0.15 155);
+  --bear: oklch(0.63 0.2 22);
+  --glass: oklch(0.28 0.02 260 / 0.42);
+  --glass-border: oklch(1 0 0 / 0.11);
+  --chart-1: oklch(0.62 0.17 253);
+  --chart-2: oklch(0.79 0.13 85);
+  --chart-3: oklch(0.75 0.15 155);
+  --chart-4: oklch(0.63 0.2 22);
+  --chart-5: oklch(0.82 0.01 260);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  html {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    color: var(--color-foreground);
+    background-color: oklch(0.17 0.02 262);
+    background-image:
+      radial-gradient(120% 80% at 12% -10%, oklch(0.32 0.07 258) 0%, transparent 60%),
+      radial-gradient(90% 70% at 100% 0%, oklch(0.26 0.05 20) 0%, transparent 55%),
+      linear-gradient(180deg, oklch(0.19 0.02 262) 0%, oklch(0.15 0.015 262) 100%);
+    background-attachment: fixed;
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::selection {
+    background: oklch(0.62 0.17 253 / 0.35);
+  }
+}
+
+@utility glass {
+  background-color: var(--glass);
+  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(22px) saturate(150%);
+  box-shadow: var(--shadow-glass);
+}
+
+@utility num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* --- Sprite cats -------------------------------------------------------- */
+
+@keyframes cat-frames {
+  from {
+    background-position-x: 0px;
+  }
+  to {
+    background-position-x: calc(var(--cat-size) * -4);
+  }
+}
+
+.cat-sprite {
+  image-rendering: pixelated;
+  background-repeat: no-repeat;
+  animation-name: cat-frames;
+  animation-timing-function: steps(4);
+  animation-iteration-count: infinite;
+  transform-origin: bottom center;
+}
+
+/* Layered motion: sprite frames + a body movement, on the same element. */
+.cat-motion {
+  animation-name: cat-frames, var(--cat-motion);
+  animation-duration: var(--cat-frame-duration), var(--cat-motion-duration);
+  animation-timing-function: steps(4), ease-in-out;
+  animation-iteration-count: infinite, infinite;
+}
+
+@keyframes cat-pounce {
+  0%,
+  30% {
+    transform: scaleX(var(--cat-flip)) scaleY(0.82) translateY(6px);
+  }
+  45% {
+    transform: scaleX(var(--cat-flip)) scaleY(0.9) translateY(4px);
+  }
+  60% {
+    transform: scaleX(var(--cat-flip)) translate(calc(22px * var(--cat-flip)), -14px);
+  }
+  80% {
+    transform: scaleX(var(--cat-flip)) translate(calc(10px * var(--cat-flip)), 0);
+  }
+  100% {
+    transform: scaleX(var(--cat-flip)) translate(0, 0);
+  }
+}
+
+@keyframes cat-fight {
+  0%,
+  100% {
+    transform: scaleX(var(--cat-flip)) rotate(0deg) translateX(0);
+  }
+  25% {
+    transform: scaleX(var(--cat-flip)) rotate(-6deg) translateX(calc(8px * var(--cat-flip)));
+  }
+  50% {
+    transform: scaleX(var(--cat-flip)) rotate(3deg) translateX(calc(-4px * var(--cat-flip)));
+  }
+  75% {
+    transform: scaleX(var(--cat-flip)) rotate(-4deg) translateX(calc(6px * var(--cat-flip)));
+  }
+}
+
+@keyframes cat-knead {
+  0%,
+  100% {
+    transform: scaleX(var(--cat-flip)) translateY(0) rotate(-1.5deg);
+  }
+  50% {
+    transform: scaleX(var(--cat-flip)) translateY(-3px) rotate(1.5deg);
+  }
+}
+
+@keyframes cat-yawn {
+  0%,
+  100% {
+    transform: scaleX(var(--cat-flip)) scaleY(1);
+  }
+  35% {
+    transform: scaleX(var(--cat-flip)) scaleY(1.08) translateY(-3px);
+  }
+  60% {
+    transform: scaleX(var(--cat-flip)) scaleY(1.05) translateY(-2px);
+  }
+}
+
+@keyframes cat-bob {
+  0%,
+  100% {
+    transform: scaleX(var(--cat-flip)) translateY(0);
+  }
+  50% {
+    transform: scaleX(var(--cat-flip)) translateY(-2px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cat-sprite {
+    animation: none;
+  }
+}

@@ -665,6 +665,7 @@ class OnlineSignalMetaLearner:
         self.target_net.load_state_dict(self.net.state_dict())
 
         self.optimizer = optim.AdamW(self.net.parameters(), lr=lr, weight_decay=1e-4)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=50000, eta_min=1e-5)
         self.replay_buffer = PrioritizedReplayBuffer(capacity=replay_capacity)
         self.reward_calculator = ForwardMoveRewardCalculator(
             lookforward_bars=SIGNAL_META_HORIZON_BARS,
@@ -916,7 +917,13 @@ class OnlineSignalMetaLearner:
         total_loss.backward()
         nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
         self.optimizer.step()
+        self.scheduler.step()
         self.total_steps += 1
+
+        # Polyak soft target network update (tau = 0.005)
+        with torch.no_grad():
+            for target_param, param in zip(self.target_net.parameters(), self.net.parameters()):
+                target_param.data.copy_(0.005 * param.data + 0.995 * target_param.data)
 
         # Update priorities in replay buffer based on TD errors
         new_prios = np.abs(td_error.detach().cpu().numpy()) + 1e-4

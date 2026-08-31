@@ -248,16 +248,96 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
     low_col   = "low_5m"   if "low_5m"   in aligned_df.columns else "low"
     vol_col   = "volume_5m" if "volume_5m" in aligned_df.columns else "volume"
 
-    # ── Label uses max evaluation horizon (12 bars = 1h) to match EXPIRY_HORIZONS ──
-    aligned_df["forward_move_12"] = aligned_df[close_col].shift(-12) - aligned_df[close_col]
+    # ── 2. Run 200+ Technical Indicators & Log Enrichment ──
+    logger.info("[TI Enrichment] Enriching aligned dataset (%d rows) with 200+ Technical Indicators...", len(aligned_df))
+    try:
+        from app.core.analysis.technical_indicators import TechnicalIndicators, IndicatorConfig
+        from app.core.ml.ti_meta_features import TI_NUMERIC_FEATURE_KEYS, CONTEXT_FEATURE_KEYS
+
+        ti_calc = TechnicalIndicators(IndicatorConfig())
+        ta_input = aligned_df.rename(columns={
+            open_col: "Open", high_col: "High", low_col: "Low", close_col: "Close", vol_col: "Volume"
+        })
+        ti_enriched = ti_calc.calculate_all_indicators(ta_input, mode="training")
+
+        ti_added_count = 0
+        for col in TI_NUMERIC_FEATURE_KEYS:
+            if col in ti_enriched.columns:
+                aligned_df[col] = ti_enriched[col].astype(np.float32)
+                ti_added_count += 1
+            else:
+                aligned_df[col] = 0.0
+
+        logger.info(
+            "✅ [TI Enrichment] Complete! Enriched dataset with %d Technical Indicators + %d Context Features (%d total columns).",
+            ti_added_count, len(CONTEXT_FEATURE_KEYS), len(aligned_df.columns)
+        )
+    except Exception as ti_err:
+        logger.warning("⚠ [TI Enrichment] Warning during TI calculation: %s", ti_err)
+
+    # ── 3. Multi-Horizon Targets & Directional Bias Labeling (5m, 15m, 30m, 1h) ──
+    aligned_df["forward_move_1"]  = aligned_df[close_col].shift(-1) - aligned_df[close_col]   # 5m
+    aligned_df["forward_move_3"]  = aligned_df[close_col].shift(-3) - aligned_df[close_col]   # 15m
+    aligned_df["forward_move_6"]  = aligned_df[close_col].shift(-6) - aligned_df[close_col]   # 30m
+    aligned_df["forward_move_12"] = aligned_df[close_col].shift(-12) - aligned_df[close_col]  # 1h
+
+    aligned_df["target_dir_5m"]  = (aligned_df["forward_move_1"]  > 0).astype(int)
+    aligned_df["target_dir_15m"] = (aligned_df["forward_move_3"]  > 0).astype(int)
+    aligned_df["target_dir_30m"] = (aligned_df["forward_move_6"]  > 0).astype(int)
+    aligned_df["target_dir_1h"]  = (aligned_df["forward_move_12"] > 0).astype(int)
+
     aligned_df.dropna(subset=["forward_move_12"], inplace=True)
 
-    # 80/20 Train / Test Split
-    split_idx = int(len(aligned_df) * 0.8)
-    train_df = aligned_df.iloc[:split_idx].reset_index(drop=True)
-    test_df = aligned_df.iloc[split_idx:].reset_index(drop=True)
+    # 70 / 15 / 15 Train / Validation / Test Split (Strict chronological order)
+    n_total = len(aligned_df)
+    train_idx = int(n_total * 0.70)
+    val_idx = int(n_total * 0.85)
 
-    print(f"Dataset Split -> Total Rows: {len(aligned_df)} | Train Rows: {len(train_df)} | Holdout Test Rows: {len(test_df)}")
+    train_df = aligned_df.iloc[:train_idx].reset_index(drop=True)
+    val_df   = aligned_df.iloc[train_idx:val_idx].reset_index(drop=True)
+    test_df  = aligned_df.iloc[val_idx:].reset_index(drop=True)
+
+    print(f"Dataset Split -> Total: {n_total} | Train (70%): {len(train_df)} | Val (15%): {len(val_df)} | Test (15%): {len(test_df)}")
+
+    # ── 4. Train-Only Scaler Fitting (Preventing Data Leakage) ──
+    try:
+        from app.core.ml.signal_meta_learner import FeatureScaler
+        scaler = FeatureScaler()
+        # Collect numeric feature columns
+        num_feature_cols = [c for c in train_df.columns if c not in ("timestamp", "Time") and np.issubdtype(train_df[c].dtype, np.number)]
+        scaler.fit(train_df[num_feature_cols].values)
+        meta_learner.scaler = scaler
+        logger.info("✅ [Scaler] FeatureScaler fitted EXCLUSIVELY on Train split (%d rows, %d feature columns).", len(train_df), len(num_feature_cols))
+    except Exception as scaler_err:
+        logger.warning("⚠ [Scaler] Notice during scaler fitting: %s", scaler_err)
+
+    # ── 5. Automatic Dataset Export & Zipping for Kaggle (Train, Val, Test, Full) ──
+    try:
+        import os
+        import zipfile
+        os.makedirs("data", exist_ok=True)
+
+        csv_train_path = "data/train_40k.csv"
+        csv_val_path   = "data/val_40k.csv"
+        csv_test_path  = "data/test_40k.csv"
+        csv_full_path  = "data/full_40k.csv"
+        zip_export_path = "data/axe_meta_dataset.zip"
+
+        train_df.to_csv(csv_train_path, index=False)
+        val_df.to_csv(csv_val_path, index=False)
+        test_df.to_csv(csv_test_path, index=False)
+        aligned_df.to_csv(csv_full_path, index=False)
+
+        with zipfile.ZipFile(zip_export_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+            zipf.write(csv_train_path, arcname="train_40k.csv")
+            zipf.write(csv_val_path,   arcname="val_40k.csv")
+            zipf.write(csv_test_path,  arcname="test_40k.csv")
+            zipf.write(csv_full_path,  arcname="full_40k.csv")
+
+        zip_mb = os.path.getsize(zip_export_path) / (1024 * 1024)
+        print(f"📦 [DataExport] Exported & zipped all enriched splits (train/val/test/full) to: {zip_export_path} ({zip_mb:.2f} MB)")
+    except Exception as exc:
+        print(f"⚠ [DataExport] Dataset zip export warning: {exc}")
 
     # ── Training Data Diagnostics ──────────────────────────────────────────────
     bullish_count = int((train_df["forward_move_12"] > 0).sum())
@@ -434,10 +514,11 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
                         elif hasattr(meta_learner, "network"):
                             best_meta_weights = {k: v.cpu().clone() for k, v in meta_learner.network.state_dict().items()}
 
+                    cur_lr = meta_learner.optimizer.param_groups[0]["lr"] if hasattr(meta_learner, "optimizer") else 0.0
                     print(
                         f"  [Meta Epoch {ep+1:>2}/{META_EPOCHS} | Step {global_step:>5}/{total_expected_steps}] total={avg_loss:.4e} (Best={best_meta_loss:.4e}) | "
                         f"q={avg_q:.4e} | str={avg_str:.4e} | pips={avg_pips:.4e} | "
-                        f"risk={avg_risk:.4e} | rev={avg_rev:.4e} | buf={buf}"
+                        f"risk={avg_risk:.4e} | rev={avg_rev:.4e} | lr={cur_lr:.2e} | buf={buf}"
                     )
                     _meta_loss_acc = _meta_loss_q_acc = _meta_loss_str_acc = 0.0
                     _meta_loss_pips_acc = _meta_loss_risk_acc = _meta_loss_liq_acc = 0.0
@@ -452,80 +533,93 @@ def evaluate_expiries_for_symbol(symbol: str = "GLD", limit: int = 40000, framew
         print(f"\n[Phase 1 Complete] Restored best Meta-Learner checkpoint (loss = {best_meta_loss:.4e}).")
 
     # ── Phase 1b: Meta-Learner Inference Pass → Q-Learner Buffer Generation ──
-    # The meta-learner makes a second sequential pass over the FULL training set.
-    # Its outputs (htf_bias) are used to construct high-quality Q-learner transitions.
-    # Only high-conviction or strong-directional bars are kept (quality gate).
-    # Buffer target: 10,000 rows — giving the Q-learner a rich, diverse memory.
+    # The meta-learner makes sequential passes over train_df to construct quality transitions.
+    # Adaptive quality gating ensures exactly Q_BUFFER_TARGET (10,000) high-conviction memories are collected.
     Q_BUFFER_TARGET = 10_000
-    print(f"\n[Phase 1b] Meta-Learner inference pass → generating {Q_BUFFER_TARGET} Q-Learner transitions from train_df...")
+    print(f"\n[Phase 1b] Meta-Learner inference pass → generating target {Q_BUFFER_TARGET} Q-Learner transitions from train_df...")
 
     q_buf_filled = 0
     q_buf_attempts = 0
     zone_manager_gen = ZoneSnapshotManager()
 
-    train_indices = list(range(len(train_df) - 13))
-    for idx in train_indices:
+    # Multi-pass threshold schedule
+    threshold_schedule = [
+        (0.60, 0.003),   # Pass 1: High conviction (strength >= 0.60 or move >= 30 pips)
+        (0.55, 0.0015),  # Pass 2: Medium conviction (strength >= 0.55 or move >= 15 pips)
+        (0.50, 0.0005),  # Pass 3: Moderate conviction
+        (0.00, 0.0000),  # Pass 4: Full dataset sampling baseline
+    ]
+
+    for pass_idx, (min_ms, min_fwd) in enumerate(threshold_schedule):
         if q_buf_filled >= Q_BUFFER_TARGET:
             break
-        q_buf_attempts += 1
+        print(f"  [Phase 1b Pass {pass_idx+1}] Sampling with min_ms={min_ms}, min_fwd={min_fwd} (Current Buffer: {q_buf_filled}/{Q_BUFFER_TARGET})...")
 
-        row = train_df.iloc[idx]
-        cp = float(row[close_col])
-        next_close = float(train_df.iloc[idx + 1][close_col])
-        fwd_pct = (next_close - cp) / (cp + 1e-8)
+        for idx in range(len(train_df) - 13):
+            if q_buf_filled >= Q_BUFFER_TARGET:
+                break
+            q_buf_attempts += 1
 
-        if idx == 0 or idx % 15 == 0 or len(zone_manager_gen.get_active_zones()) == 0:
-            update_real_snr_snapshot(train_df, idx, zone_manager_gen)
-        zone_manager_gen.update_invalidation(cp, float(row[high_col]), float(row[low_col]))
+            row = train_df.iloc[idx]
+            cp = float(row[close_col])
+            
+            # Evaluate max forward move across multi-horizon window (1 to 12 bars)
+            max_fwd_cp = max([float(train_df.iloc[idx + k][close_col]) for k in (1, 3, 6, 12)])
+            min_fwd_cp = min([float(train_df.iloc[idx + k][close_col]) for k in (1, 3, 6, 12)])
+            fwd_pct = (max_fwd_cp - cp) / (cp + 1e-8) if abs(max_fwd_cp - cp) > abs(min_fwd_cp - cp) else (min_fwd_cp - cp) / (cp + 1e-8)
 
-        f_dict = _row_to_feature_dict(row, close_col, vol_col)
-        pred = meta_learner.predict(f_dict)
-        ms = float(pred.get("signal_strength", 0.5))
+            if idx == 0 or idx % 15 == 0 or len(zone_manager_gen.get_active_zones()) == 0:
+                update_real_snr_snapshot(train_df, idx, zone_manager_gen)
+            zone_manager_gen.update_invalidation(cp, float(row[high_col]), float(row[low_col]))
 
-        if ms < 0.65 and abs(fwd_pct) < 0.005:
-            continue
+            f_dict = _row_to_feature_dict(row, close_col, vol_col)
+            pred = meta_learner.predict(f_dict)
+            ms = float(pred.get("signal_strength", 0.5))
 
-        bias = HTFBiasPackage(
-            direction="bullish" if ms > 0.5 else "bearish",
-            strength=ms,
-            reversal_prob=float(pred.get("reversal_prob", 0.2)),
-            q_value=float(pred.get("q_value", 0.5)),
-            expected_mfe_pips=float(pred.get("expected_mfe_pips", 50.0)),
-            expected_mae_pips=float(pred.get("expected_mae_pips", 15.0)),
-            horizon_strengths=pred.get("horizon_strengths", [0.5, 0.5, 0.5, 0.5]),
-            optimal_horizon_idx=int(pred.get("optimal_horizon_idx", 2)),
-            recommended_expiry=str(pred.get("recommended_expiry", "30m")),
-        )
-        ctx = _make_exec_ctx(symbol, cp, dict(row))
-        state = q_executor.build_state_vector(bias, account, ctx, zone_manager_gen)
-        mask_engine = HardActionMask()
-        action_mask = mask_engine.get_action_mask(
-            current_price=cp, atr=ctx.atr, zone_manager=zone_manager_gen,
-            buy_volume=ctx.buy_volume, sell_volume=ctx.sell_volume, has_open_position=False,
-        )
+            if ms < min_ms and abs(fwd_pct) < min_fwd:
+                continue
 
-        if action_mask[1] == 1 and bias.direction == "bullish" and fwd_pct >= 0.003:
-            oracle_action = 1
-        elif action_mask[2] == 1 and bias.direction == "bearish" and fwd_pct <= -0.003:
-            oracle_action = 2
-        else:
-            oracle_action = 0
+            bias = HTFBiasPackage(
+                direction="bullish" if ms > 0.5 else "bearish",
+                strength=ms,
+                reversal_prob=float(pred.get("reversal_prob", 0.2)),
+                q_value=float(pred.get("q_value", 0.5)),
+                expected_mfe_pips=float(pred.get("expected_mfe_pips", 50.0)),
+                expected_mae_pips=float(pred.get("expected_mae_pips", 15.0)),
+                horizon_strengths=pred.get("horizon_strengths", [0.5, 0.5, 0.5, 0.5]),
+                optimal_horizon_idx=int(pred.get("optimal_horizon_idx", 2)),
+                recommended_expiry=str(pred.get("recommended_expiry", "30m")),
+            )
+            ctx = _make_exec_ctx(symbol, cp, dict(row))
+            state = q_executor.build_state_vector(bias, account, ctx, zone_manager_gen)
+            mask_engine = HardActionMask()
+            action_mask = mask_engine.get_action_mask(
+                current_price=cp, atr=ctx.atr, zone_manager=zone_manager_gen,
+                buy_volume=ctx.buy_volume, sell_volume=ctx.sell_volume, has_open_position=False,
+            )
 
-        reward = q_executor.calculate_executor_reward(
-            action=oracle_action, action_mask=action_mask, pnl_pct=fwd_pct,
-            max_drawdown_exposed=0.005, forward_move_pct=fwd_pct, htf_bias=bias,
-        )
+            if action_mask[1] == 1 and bias.direction == "bullish" and fwd_pct >= 0.0015:
+                oracle_action = 1
+            elif action_mask[2] == 1 and bias.direction == "bearish" and fwd_pct <= -0.0015:
+                oracle_action = 2
+            else:
+                oracle_action = 0
 
-        next_row = train_df.iloc[idx + 1]
-        next_cp = float(next_row[close_col])
-        next_ctx = _make_exec_ctx(symbol, next_cp, dict(next_row))
-        next_state = q_executor.build_state_vector(bias, account, next_ctx, zone_manager_gen)
+            reward = q_executor.calculate_executor_reward(
+                action=oracle_action, action_mask=action_mask, pnl_pct=fwd_pct,
+                max_drawdown_exposed=0.005, forward_move_pct=fwd_pct, htf_bias=bias,
+            )
 
-        q_executor.record_transition(state, oracle_action, reward, next_state, False, action_mask)
-        q_buf_filled += 1
+            next_row = train_df.iloc[idx + 1]
+            next_cp = float(next_row[close_col])
+            next_ctx = _make_exec_ctx(symbol, next_cp, dict(next_row))
+            next_state = q_executor.build_state_vector(bias, account, next_ctx, zone_manager_gen)
 
-        if q_buf_filled % 1000 == 0:
-            print(f"  [Phase 1b] Buffer: {q_buf_filled}/{Q_BUFFER_TARGET} transitions | Scanned: {q_buf_attempts} bars")
+            q_executor.record_transition(state, oracle_action, reward, next_state, False, action_mask)
+            q_buf_filled += 1
+
+            if q_buf_filled % 2000 == 0:
+                print(f"  [Phase 1b] Buffer: {q_buf_filled}/{Q_BUFFER_TARGET} transitions | Scanned: {q_buf_attempts} bars")
 
     print(f"  [Phase 1b] Complete: {q_buf_filled} transitions generated from {q_buf_attempts} scanned bars.")
 

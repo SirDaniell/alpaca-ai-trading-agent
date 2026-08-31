@@ -92,7 +92,7 @@ def test_hard_action_mask_no_chase(zone_manager):
 # ── 3. Q-Learner Network Weights Update Test ──────────────────────────────────
 
 def test_q_executor_weights_update(zone_manager):
-    executor = OptionsQExecutor(input_dim=24, lr=1e-3, epsilon_start=0.5)
+    executor = OptionsQExecutor(input_dim=28, lr=1e-3, epsilon_start=0.5)
     htf_bias = HTFBiasPackage(direction="bullish", strength=0.8, reversal_prob=0.1, q_value=0.7)
     account = AccountContext()
     exec_ctx = ExecutionContext(current_price=100.1, atr=1.0, buy_volume=1000, sell_volume=500)
@@ -102,7 +102,7 @@ def test_q_executor_weights_update(zone_manager):
 
     # Populate replay buffer
     for _ in range(40):
-        next_state = state + np.random.randn(24).astype(np.float32) * 0.01
+        next_state = state + np.random.randn(28).astype(np.float32) * 0.01
         reward = float(np.random.randn())
         executor.record_transition(state, ACTION_BUY_CALL, reward, next_state, False, mask)
 
@@ -117,7 +117,7 @@ def test_q_executor_weights_update(zone_manager):
 # ── 4. Virtual Trade Execution & Transition Recording ─────────────────────────
 
 def test_virtual_trade_execution_flow(zone_manager):
-    executor = OptionsQExecutor(input_dim=24, epsilon_start=0.0)  # Greedy mode
+    executor = OptionsQExecutor(input_dim=28, epsilon_start=0.0)  # Greedy mode
     htf_bias = HTFBiasPackage(direction="bullish", strength=0.75, reversal_prob=0.15)
     account = AccountContext(open_position_type=None)
     exec_ctx = ExecutionContext(current_price=100.1, atr=1.0, buy_volume=1000, sell_volume=400)
@@ -167,9 +167,10 @@ def test_dual_execution_timeframe_switch(zone_manager):
     ctx_15m = ExecutionContext(ltf_timeframe="15m", current_price=100.1)
     s_15m = executor.build_state_vector(htf_bias, account, ctx_15m, zone_manager)
 
-    assert len(s_5m) == len(s_15m) == 24
-    assert s_5m[11] == 0.0  # 5m flag
-    assert s_15m[11] == 1.0  # 15m flag
+    assert len(s_5m) == len(s_15m) == 28
+    # ltf_timeframe flag is at index 15 (Execution & Zone Context block, first feature)
+    assert s_5m[15] == 0.0   # 5m flag = 0.0
+    assert s_15m[15] == 1.0  # 15m flag = 1.0
 
 
 def test_time_and_session_features_encoding(zone_manager):
@@ -183,9 +184,9 @@ def test_time_and_session_features_encoding(zone_manager):
     ctx_power = ExecutionContext(hour_of_day=20.0, day_of_week=4, session_phase="nyse_power_hour")
     s_power = executor.build_state_vector(htf_bias, account, ctx_power, zone_manager)
 
-    # Check sin/cos hour and session flags
-    assert s_open[26] == 1.0  # is_nyse_open
-    assert s_open[27] == 0.0  # is_power_hour
-    assert s_power[26] == 0.0
+    # Time & Session block starts at index 23: [sin_hour, cos_hour, dow_norm, is_nyse_open, is_power_hour]
+    assert s_open[26] == 1.0   # is_nyse_open
+    assert s_open[27] == 0.0   # is_power_hour
+    assert s_power[26] == 0.0  # not nyse_open
     assert s_power[27] == 1.0  # is_power_hour
 

@@ -22,9 +22,9 @@ def test_auxiliary_gradient_isolation():
     do NOT send gradients to primary heads (q_head, strength_head) or shared backbone parameters.
     """
     net = SignalMetaNetwork(input_dim=DECISION_WINDOW_DIM, num_actions=4)
-    x = torch.randn(4, DECISION_WINDOW_DIM, requires_grad=True)
+    x = torch.randn(4, 48, 238, requires_grad=True)
 
-    q_vals, strength, pips, risk, liquidity, reversal, aux1, aux2 = net(x, return_aux=True)
+    q_vals, strength, pips, risk, liquidity, reversal, aux1, aux2, fusion_sel = net(x, return_aux=True)
 
     # Compute auxiliary loss
     loss_aux = pips.sum() + risk.sum() + liquidity.sum() + reversal.sum() + aux1.sum() + aux2.sum()
@@ -34,15 +34,15 @@ def test_auxiliary_gradient_isolation():
     assert net.q_head.weight.grad is None
     assert net.strength_head[0].weight.grad is None
     # Shared fusion backbone MUST have zero/None gradient from auxiliary heads
-    assert net.fusion_fc1.weight.grad is None
-    assert net.b1_fc1.weight.grad is None
-    assert net.b2_c1.weight.grad is None
+    assert net.fusion_fc.weight.grad is None
+    assert net.b1_conv1.weight.grad is None
+    assert net.b2_conv.weight.grad is None
 
     # Auxiliary heads MUST have non-None gradients
-    assert net.pips_head.weight.grad is not None
-    assert net.risk_head.weight.grad is not None
-    assert net.liquidity_head.weight.grad is not None
-    assert net.reversal_head[0].weight.grad is not None
+    assert net.pips_head[-1].weight.grad is not None
+    assert net.risk_head[-1].weight.grad is not None
+    assert net.liquidity_head[-1].weight.grad is not None
+    assert net.reversal_head[1].weight.grad is not None
     assert net.aux1_head.weight.grad is not None
     assert net.aux2_head.weight.grad is not None
 
@@ -52,7 +52,7 @@ def test_primary_gradient_flow():
     Verify that primary losses (loss_q, loss_strength) flow correctly to the shared backbone and primary heads.
     """
     net = SignalMetaNetwork(input_dim=DECISION_WINDOW_DIM, num_actions=4)
-    x = torch.randn(4, DECISION_WINDOW_DIM, requires_grad=True)
+    x = torch.randn(4, 48, 238, requires_grad=True)
 
     q_vals, strength, _, _, _, _ = net(x)
     loss_primary = q_vals.sum() + strength.sum()
@@ -62,18 +62,18 @@ def test_primary_gradient_flow():
     assert net.q_head.weight.grad is not None
     assert net.strength_head[0].weight.grad is not None
     # Shared fusion & branch backbones MUST receive gradients
-    assert net.fusion_fc1.weight.grad is not None
-    assert net.b1_fc1.weight.grad is not None
-    assert net.b2_c1.weight.grad is not None
+    assert net.fusion_fc.weight.grad is not None
+    assert net.b1_conv1.weight.grad is not None
+    assert net.b2_conv.weight.grad is not None
 
 
 def test_auxiliary_loss_boundedness_with_large_targets():
     """
     Verify that even with large raw targets (e.g. 500 pips MFE, 300 pips MAE, 8.5 ATR zone distance),
-    the normalized auxiliary losses stay bounded (< 1.0 each) and do not dominate total loss.
+    the normalized auxiliary losses stay bounded (< 5.0 each) and do not dominate total loss.
     """
     learner = OnlineSignalMetaLearner(input_dim=DECISION_WINDOW_DIM)
-    dummy_input = np.zeros(DECISION_WINDOW_DIM, dtype=np.float32)
+    dummy_input = np.zeros((48, 238), dtype=np.float32)
 
     # Seed replay buffer with large-target transitions
     for i in range(16):
@@ -108,14 +108,14 @@ def test_predict_unscaling_consistency():
 
     # Mock net predictions for pips, risk, liquidity
     with torch.no_grad():
-        learner.net.pips_head.weight.zero_()
-        learner.net.pips_head.bias.fill_(1.5)        # 1.5 * 100.0 = 150.0 expected pips
+        learner.net.pips_head[-1].weight.zero_()
+        learner.net.pips_head[-1].bias.fill_(1.5)        # 1.5 * 100.0 = 150.0 expected pips
 
-        learner.net.risk_head.weight.zero_()
-        learner.net.risk_head.bias.fill_(2.0)        # 2.0 * 100.0 = 200.0 expected MFE/MAE
+        learner.net.risk_head[-1].weight.zero_()
+        learner.net.risk_head[-1].bias.fill_(2.0)        # 2.0 * 100.0 = 200.0 expected MFE/MAE
 
-        learner.net.liquidity_head.weight.zero_()
-        learner.net.liquidity_head.bias.fill_(0.5)   # 0.5 * 10.0 = 5.0 ATR distance
+        learner.net.liquidity_head[-1].weight.zero_()
+        learner.net.liquidity_head[-1].bias.fill_(0.5)   # 0.5 * 10.0 = 5.0 ATR distance
 
     dummy_input = {"rsi": 50.0}
     pred = learner.predict(dummy_input)
@@ -124,3 +124,4 @@ def test_predict_unscaling_consistency():
     assert pred['expected_mfe_pips'] == pytest.approx(2.0 * TARGET_PIP_SCALE, abs=0.1)
     assert pred['expected_mae_pips'] == pytest.approx(2.0 * TARGET_PIP_SCALE, abs=0.1)
     assert pred['next_zone_dist_atr'] == pytest.approx(0.5 * TARGET_ZONE_DIST_SCALE, abs=0.1)
+

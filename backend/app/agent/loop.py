@@ -25,6 +25,7 @@ from app.core.market.divergence_scale import build_unified_divergence_scale
 from app.core.market.signal_events import build_signal_bundle
 from app.core.analysis.support_resistance import detect_snr_levels_sequential, create_clustered_zones_sequential
 from app.core.market.zone_snapshot import ZoneSnapshotManager, HardActionMask
+from app.core.ml.signal_meta_learner import OnlineSignalMetaLearner
 from app.core.options.q_executor import OptionsQExecutor, HTFBiasPackage, AccountContext, ExecutionContext, ACTION_BUY_CALL, ACTION_BUY_PUT, ACTION_TAKE_PROFIT_HALF, ACTION_CLOSE_FLATTEN, ACTION_WAIT
 from app.core.options.options_order import select_target_option_contract
 from app.core.options.pipeline_options import OptionsPipelineConfig
@@ -44,6 +45,7 @@ LOOKBACK = int(os.getenv("MARKET_LOOKBACK_BARS", "500"))
 # Global singleton instances
 zone_manager = ZoneSnapshotManager(max_snapshots=20)
 q_executor = OptionsQExecutor()
+meta_learner = OnlineSignalMetaLearner()
 
 
 def fetch_market_data(client: AlpacaClient, symbol: str) -> list:
@@ -162,14 +164,24 @@ def run_cycle():
             current_low = float(df_candles["Low"].iloc[-1])
             zone_manager.update_invalidation(current_close, current_high, current_low)
 
-            # 2. Derive Tier 1 HTF Bias Context (simulated / meta-learner output)
+            # 2. Derive Tier 1 HTF Bias Package using OnlineSignalMetaLearner (PyTorch Multi-Head)
+            direction = "bullish" if current_close > float(df_candles["Close"].iloc[-10]) else "bearish"
+            feat_dict = {
+                "close": current_close,
+                "high": current_high,
+                "low": current_low,
+                "volume": float(df_candles["Volume"].iloc[-1]),
+                "change": float(current_close - df_candles["Close"].iloc[-2]),
+            }
+            meta_pred = meta_learner.predict(feat_dict, signal_type="zone-breakout", direction=direction)
+
             htf_bias = HTFBiasPackage(
-                direction="bullish" if current_close > df_candles["Close"].iloc[-10] else "bearish",
-                strength=0.72,
-                reversal_prob=0.18,
-                q_value=0.65,
-                expected_mfe_pips=50.0,
-                expected_mae_pips=15.0,
+                direction=direction,
+                strength=meta_pred["signal_strength"],
+                reversal_prob=meta_pred["reversal_prob"],
+                q_value=meta_pred["confidence"],
+                expected_mfe_pips=meta_pred["expected_mfe_pips"],
+                expected_mae_pips=meta_pred["expected_mae_pips"],
             )
 
             # 3. Time & Session Context
