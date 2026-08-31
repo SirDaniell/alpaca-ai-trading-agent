@@ -848,193 +848,391 @@ if best_meta_weights is not None:
 """
 
 CELL_PHASE2_Q_TRAINING = """# =============================================================================
-# PHASE 2: Q-EXECUTOR TRAVERSAL TRAINING OVER train_df (rewritten)
-#
-# Fixes applied vs. the original:
-#  1. SEQUENTIAL walk instead of random.shuffle(indices) — account state (win/loss
-#     streak, drawdown, open position) is inherently path-dependent and meaningless
-#     under shuffled order. The notebook's own comment called this a "practice maze
-#     traversal", which already implied sequential walking was the real intent.
-#  2. REAL zone-anchored HardActionMask — computed from actual detect_snr_levels_sequential
-#     zones (via up_to_index, no lookahead), not a volume-only mask that ignored zones entirely.
-#  3. REAL 28-dim state vector, 1:1 with backend q_executor.py — and critically, NO
-#     future-derived value anywhere in it. The previous version put the literal forward
-#     price move (the reward target) into state_vec[4] as an INPUT feature — the network
-#     was being handed the answer. That's removed entirely; fwd_pct is used ONLY for the
-#     reward, never as a model input.
-#  4. Missed-opportunity (hindsight) penalty is now GATED by the real hard mask — it only
-#     fires when the mask would have actually allowed the trade (i.e. price was genuinely
-#     near a confirmed, volume-backed zone), not on raw meta-learner confidence alone.
-#     Ungated, this risked teaching the agent to trade too liberally.
+# PHASE 2: PRECOMPUTE META + ZONES, THEN FAST SEQUENTIAL Q-LEARNING
+# Refactored: Multi-head meta feature caching, option auto-settlement,
+# live unrealized PnL state tracking, real close rewards, mask-guided Q-learning.
 # =============================================================================
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.nn.parallel import DataParallel
+import time
+import numpy as np
+import random
+import pandas as pd
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+n_gpus = torch.cuda.device_count()
+print(f"GPUs available: {n_gpus}")
+
+HORIZON_BARS_LIST = [1, 3, 6, 12]  # 5m, 15m, 30m, 1h
+
+# ---------- 1. Wrap meta-net for multi-GPU inference ----------
+net.eval()
+if n_gpus > 1:
+    meta_dp = DataParallel(net)
+    print("Meta-learner wrapped with DataParallel across", n_gpus, "GPUs")
+else:
+    meta_dp = net
+
+# ---------- 2. Precompute meta outputs in large batches ----------
+PRECOMPUTE_BATCH = 256
+N_train = len(train_df) - lookback_bars - 12
+
+print(f"[Precompute] Meta features for {N_train} steps (batch={PRECOMPUTE_BATCH})...")
+t0 = time.time()
+
+meta_strengths = np.zeros((N_train, 4), dtype=np.float32)
+meta_qmax     = np.zeros(N_train, dtype=np.float32)
+meta_rev      = np.zeros(N_train, dtype=np.float32)
+meta_mfe      = np.zeros(N_train, dtype=np.float32)
+meta_mae      = np.zeros(N_train, dtype=np.float32)
+
+with torch.no_grad():
+    for start in range(0, N_train, PRECOMPUTE_BATCH):
+        end = min(start + PRECOMPUTE_BATCH, N_train)
+        batch_x = np.stack([
+            train_num_matrix[i : i + lookback_bars].flatten()
+            for i in range(start, end)
+        ])
+        x_t = torch.tensor(batch_x, dtype=torch.float32, device=device)
+        q_vals, strength, pips, risk, liq, rev = meta_dp(x_t)
+        
+        meta_strengths[start:end] = strength.cpu().numpy()
+        meta_qmax[start:end]      = q_vals.max(dim=1).values.cpu().numpy()
+        meta_rev[start:end]       = rev.squeeze(-1).cpu().numpy() if rev.ndim > 1 else rev.cpu().numpy()
+        if risk.shape[-1] >= 2:
+            meta_mfe[start:end]   = risk[:, 0].cpu().numpy()
+            meta_mae[start:end]   = risk[:, 1].cpu().numpy()
+        if (start // PRECOMPUTE_BATCH) % 20 == 0:
+            print(f"  meta precompute {end}/{N_train}")
+
+meta_strengths = np.nan_to_num(meta_strengths, nan=0.5, posinf=1.0, neginf=0.0)
+meta_qmax      = np.nan_to_num(meta_qmax, nan=0.5, posinf=1.0, neginf=0.0)
+meta_rev       = np.nan_to_num(meta_rev, nan=0.2, posinf=1.0, neginf=0.0)
+meta_mfe       = np.nan_to_num(meta_mfe, nan=0.5, posinf=10.0, neginf=0.0)
+meta_mae       = np.nan_to_num(meta_mae, nan=0.15, posinf=10.0, neginf=0.0)
+
+print(f"Meta precompute done in {time.time()-t0:.1f}s")
+
+# ---------- 3. Precompute zones + nearest support/resistance ----------
+print("[Precompute] SNR zones...")
+t1 = time.time()
+
+price_data_hl = train_df[[open_col, high_col, low_col, close_col, vol_col]].rename(
+    columns={open_col: "Open", high_col: "High", low_col: "Low",
+             close_col: "Close", vol_col: "Volume"}
+)
+
+nearest_supp_list = [None] * N_train
+nearest_res_list  = [None] * N_train
+close_prices = train_df[close_col].values.astype(np.float64)
+atr_vals = train_df[atr_col].values.astype(np.float64) if atr_col else (close_prices * 0.005)
+up_vols  = train_df[up_vol_col].values.astype(np.float64) if up_vol_col else np.zeros(len(train_df))
+dn_vols  = train_df[down_vol_col].values.astype(np.float64) if down_vol_col else np.zeros(len(train_df))
+
+ZONE_STRIDE = 5
+last_zones = []
+for i in range(N_train):
+    abs_idx = i + lookback_bars
+    if i % ZONE_STRIDE == 0 or not last_zones:
+        lb = min(ZONE_LOOKBACK_PERIOD, abs_idx)
+        levels = detect_snr_levels_sequential(
+            price_data_hl, up_to_index=abs_idx,
+            lookback_period=lb, min_distance_pct=ZONE_MIN_DISTANCE_PCT
+        ) if abs_idx >= 20 else []
+        df_slice = price_data_hl.iloc[max(0, abs_idx - ZONE_LOOKBACK_PERIOD): abs_idx + 1]
+        last_zones = create_clustered_zones_sequential(
+            levels, df_slice, n_clusters=min(8, max(3, len(levels)))
+        ) if levels else []
+    ns, nr = get_nearest_zones(last_zones, close_prices[abs_idx])
+    nearest_supp_list[i] = ns
+    nearest_res_list[i]  = nr
+    if i % 5000 == 0:
+        print(f"  zones {i}/{N_train}")
+
+print(f"Zone precompute done in {time.time()-t1:.1f}s")
+
+# ---------- 4. Precompute static state features (recommended-horizon indexed) ----------
+print("[Precompute] static state features...")
+static_states = np.zeros((N_train, 28), dtype=np.float32)
+
+for i in range(N_train):
+    abs_idx = i + lookback_bars
+    row = train_df.iloc[abs_idx]
+    cp  = close_prices[abs_idx]
+    atr = max(0.01, atr_vals[abs_idx])
+    bv, sv = up_vols[abs_idx], dn_vols[abs_idx]
+
+    ts = row.get("timestamp", None)
+    hour_f, dow, phase = 14.5, 1, "off_hours"
+    if ts is not None:
+        try:
+            ts_pd = pd.Timestamp(ts)
+            if ts_pd.tzinfo is None:
+                ts_pd = ts_pd.tz_localize("UTC")
+            ts_et = ts_pd.tz_convert("America/New_York")
+            hour_f = ts_et.hour + ts_et.minute / 60.0
+            dow = ts_et.dayofweek
+            if 9.5 <= hour_f < 10.5:
+                phase = "nyse_open"
+            elif 15.0 <= hour_f < 16.0:
+                phase = "nyse_power_hour"
+            elif 9.5 <= hour_f < 16.0:
+                phase = "regular_hours"
+        except Exception:
+            pass
+
+    strength_vec = meta_strengths[i]
+    opt_h = int(np.argmax(strength_vec))
+    meta_score = float(strength_vec[opt_h])  # Recommended horizon strength
+    dir_flag = 1.0 if meta_score > 0.5 else (-1.0 if meta_score < 0.5 else 0.0)
+    hs = strength_vec.tolist()
+
+    ns = nearest_supp_list[i]
+    nr = nearest_res_list[i]
+    supp_dist = abs(cp - ns["price_level"]) / cp if ns else 1.0
+    res_dist  = abs(cp - nr["price_level"]) / cp if nr else 1.0
+    supp_vol_ratio = ns["volume_delta_ratio"] if ns else 0.0
+    res_vol_ratio  = nr["volume_delta_ratio"] if nr else 0.0
+    total_vol = bv + sv
+    vol_delta_ratio = (bv - sv) / (total_vol + 1e-6)
+
+    sin_hour = np.sin(2 * np.pi * hour_f / 24.0)
+    cos_hour = np.cos(2 * np.pi * hour_f / 24.0)
+    dow_norm = dow / 6.0
+    is_nyse_open = 1.0 if phase == "nyse_open" else 0.0
+    is_power_hour = 1.0 if phase == "nyse_power_hour" else 0.0
+
+    static_states[i] = [
+        dir_flag, meta_score, float(meta_rev[i]), float(meta_qmax[i]),
+        float(meta_mfe[i]), float(meta_mae[i]),
+        hs[0], hs[1], hs[2], hs[3],
+        0.0,                          # daily_drawdown (account)
+        0.0,                          # open_position_type
+        0.0,                          # open_position_pnl
+        0.0, 0.0,                     # win/loss streak
+        0.0,                          # tf_flag (5m)
+        atr / cp, supp_dist, res_dist,
+        supp_vol_ratio, res_vol_ratio, vol_delta_ratio,
+        0.0,                          # reentries
+        sin_hour, cos_hour, dow_norm, is_nyse_open, is_power_hour,
+    ]
+
+static_states = np.nan_to_num(static_states, nan=0.0, posinf=0.0, neginf=0.0)
+print("Static state cache ready and sanitized.")
+
+# ---------- 5. Fast sequential Q-learning with Auto-Settlement & Live PnL ----------
 q_net = ExecutorQNetwork(input_dim=28, hidden_dim=64, num_actions=5).to(device)
 q_target = ExecutorQNetwork(input_dim=28, hidden_dim=64, num_actions=5).to(device)
 q_target.load_state_dict(q_net.state_dict())
 q_opt = optim.AdamW(q_net.parameters(), lr=1e-3, weight_decay=1e-4)
 
 Q_EPOCHS = 50
-BATCH_SIZE_Q = 128
-BUFFER_CAPACITY = 20000
-TARGET_VAL_WIN_RATE = 70.0
+BATCH_SIZE_Q = 256
+BUFFER_CAPACITY = 30000
 replay_buffer = []
 
 epsilon = 1.0
 epsilon_min = 0.05
-epsilon_decay = 0.9995
+epsilon_decay_per_epoch = 0.92
 
-net.eval()
 mask_engine = HardActionMask()
 
-best_val_wr = 0.0
-best_q_weights = None
-
-print(f"🚀 [Phase 2] Q-Executor Sequential Training & Validation (Max {Q_EPOCHS} Epochs | Target WR: {TARGET_VAL_WIN_RATE}%)...")
+print(f"[Phase 2] Sequential Q-learning with Option Auto-Expiry (Max {Q_EPOCHS} Epochs)...")
 
 for q_epoch in range(Q_EPOCHS):
     account = AccountContext()
-    _q_loss_acc = 0.0
+    open_position = None
     action_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
-    open_position = None  # {action, entry_idx, entry_price}
+    _q_loss_acc = 0.0
+    _q_steps = 0
 
-    train_trades, train_wins, train_losses = 0, 0, 0
-    train_win_streak, train_loss_streak = 0, 0
-    max_tr_win_streak, max_tr_loss_streak = 0, 0
-    total_win_pnl, total_loss_pnl = 0.0, 0.0
-    peak_equity, max_drawdown = 10000.0, 0.0
+    for i in range(N_train):
+        abs_idx = i + lookback_bars
+        cp = close_prices[abs_idx]
+        atr = max(0.01, atr_vals[abs_idx])
+        bv, sv = up_vols[abs_idx], dn_vols[abs_idx]
+        ns, nr = nearest_supp_list[i], nearest_res_list[i]
 
-    # ── TRAIN TRAVERSAL ──
-    for idx in range(N_train):
-        x_seq = train_num_matrix[idx: idx + lookback_bars].flatten()
-        x_t = torch.tensor(x_seq, dtype=torch.float32, device=device).unsqueeze(0)
-        with torch.no_grad():
-            q_vals, strength, pips, risk, liq, rev = net(x_t)
+        strength_vec = meta_strengths[i]
+        opt_horizon_idx = int(np.argmax(strength_vec))
+        meta_score = float(strength_vec[opt_horizon_idx])
+        lookahead = HORIZON_BARS_LIST[opt_horizon_idx]
 
-        strength_vec = strength.squeeze(0).cpu().numpy()
-        meta_score = float(strength_vec.mean())
-        row = train_df.iloc[idx + lookback_bars]
-        cp = float(row[close_col])
-        row_idx_abs = idx + lookback_bars
+        # Auto-expire option at recommended horizon (path-dependent settlement)
+        if open_position is not None:
+            bars_held = i - open_position["entry_i"]
+            if bars_held >= open_position["horizon"]:
+                entry_p = open_position["entry_price"]
+                pnl = (cp - entry_p) / (entry_p + 1e-8)
+                if open_position["action"] == 2:
+                    pnl = -pnl
+                if pnl > 0:
+                    account.win_streak += 1
+                    account.loss_streak = 0
+                else:
+                    account.loss_streak += 1
+                    account.win_streak = 0
+                
+                settle_reward = float(np.clip(pnl - 0.0005, -0.05, 0.05))
+                state_close = static_states[i].copy()
+                state_close[10] = account.daily_drawdown_pct
+                state_close[11] = 1.0 if open_position["action"] == 1 else -1.0
+                state_close[12] = float(pnl)
+                state_close[13] = account.win_streak / 10.0
+                state_close[14] = account.loss_streak / 10.0
+                
+                next_flat = static_states[min(i + 1, N_train - 1)].copy()
+                next_flat[11] = 0.0
+                next_flat[12] = 0.0
+                
+                replay_buffer.append((state_close, 4, settle_reward, next_flat, np.array([1, 0, 0, 0, 0], dtype=np.int32)))
+                if len(replay_buffer) > BUFFER_CAPACITY:
+                    replay_buffer.pop(0)
+                
+                open_position = None
+                account.open_position_type = None
+                account.open_position_pnl_pct = 0.0
+                account.reentries_in_window = 0
 
-        exec_ctx = _make_exec_ctx(SYMBOL, cp, dict(row), atr_col, up_vol_col, down_vol_col)
-        bias = HTFBiasPackage(
-            direction="bullish" if meta_score > 0.5 else "bearish",
-            strength=meta_score, reversal_prob=float(rev.mean().item()),
-            q_value=float(q_vals.max().item()),
-            expected_mfe_pips=float(risk[0, 0].item()) * 100.0 if risk.shape[-1] > 0 else 0.0,
-            expected_mae_pips=float(risk[0, 1].item()) * 100.0 if risk.shape[-1] > 1 else 0.0,
-            horizon_strengths=strength_vec.tolist(),
-        )
-
-        price_data_hl = train_df[[open_col, high_col, low_col, close_col, vol_col]].rename(
-            columns={open_col: "Open", high_col: "High", low_col: "Low", close_col: "Close", vol_col: "Volume"}
-        )
-        levels = detect_snr_levels_sequential(price_data_hl, up_to_index=row_idx_abs,
-                                                lookback_period=min(ZONE_LOOKBACK_PERIOD, row_idx_abs),
-                                                min_distance_pct=ZONE_MIN_DISTANCE_PCT) if row_idx_abs >= 20 else []
-        df_slice = price_data_hl.iloc[max(0, row_idx_abs - ZONE_LOOKBACK_PERIOD): row_idx_abs + 1]
-        zones = create_clustered_zones_sequential(levels, df_slice, n_clusters=min(8, max(3, len(levels)))) if levels else []
-        nearest_supp, nearest_res = get_nearest_zones(zones, cp)
+        # Mark-to-market live unrealized PnL state update while position is open
+        if open_position is not None:
+            unreal = (cp - open_position["entry_price"]) / (open_position["entry_price"] + 1e-8)
+            if open_position["action"] == 2:
+                unreal = -unreal
+            account.open_position_pnl_pct = float(unreal)
+        else:
+            account.open_position_pnl_pct = 0.0
 
         has_open = open_position is not None
         action_mask = mask_engine.get_action_mask(
-            cp, exec_ctx.atr, nearest_supp, nearest_res, exec_ctx.buy_volume, exec_ctx.sell_volume, has_open_position=has_open
+            cp, atr, ns, nr, bv, sv, has_open_position=has_open
         )
-        state_vec = build_state_vector(None, bias, account, exec_ctx, nearest_supp, nearest_res)
 
-        valid_actions = [a for a in range(5) if action_mask[a] == 1]
-        if not valid_actions: valid_actions = [0]
+        state = static_states[i].copy()
+        state[10] = account.daily_drawdown_pct
+        state[11] = 1.0 if account.open_position_type == "CALL" else (
+                    -1.0 if account.open_position_type == "PUT" else 0.0)
+        state[12] = account.open_position_pnl_pct
+        state[13] = account.win_streak / 10.0
+        state[14] = account.loss_streak / 10.0
+        state[22] = account.reentries_in_window / max(1, account.max_reentries_allowed)
+
+        valid = [a for a in range(5) if action_mask[a] == 1] or [0]
 
         if random.random() < epsilon:
-            action = random.choice(valid_actions)
+            action = random.choice(valid)
         else:
             q_net.eval()
             with torch.no_grad():
-                st_t = torch.tensor(state_vec, device=device).unsqueeze(0)
+                st_t = torch.tensor(state, device=device).unsqueeze(0)
                 q_out = q_net(st_t).squeeze(0).cpu().numpy()
-                masked_q = np.where(action_mask == 1, q_out, -1e9)
-                action = int(np.argmax(masked_q))
+                masked = np.where(action_mask == 1, q_out, -1e9)
+                action = int(np.argmax(masked))
         action_counts[action] += 1
 
-        fwd_cps = [float(train_df.iloc[idx + lookback_bars + k][close_col]) for k in (1, 3, 6, 12) if (idx + lookback_bars + k) < len(train_df)]
-        if not fwd_cps: continue
-        max_cp, min_cp = max(fwd_cps), min(fwd_cps)
-        fwd_pct = (max_cp - cp) / (cp + 1e-8) if abs(max_cp - cp) > abs(min_cp - cp) else (min_cp - cp) / (cp + 1e-8)
+        if abs_idx + lookahead >= len(train_df):
+            continue
+        expiry_cp = close_prices[abs_idx + lookahead]
+        fwd_pct = float(np.clip((expiry_cp - cp) / (cp + 1e-8), -0.05, 0.05))
 
-        if not has_open and action in (1, 2):
-            open_position = {"action": action, "entry_idx": idx, "entry_price": cp}
-            account.open_position_type = "CALL" if action == 1 else "PUT"
+        if not has_open and action == 1:
+            open_position = {
+                "action": 1, "entry_price": cp, "entry_i": i, "horizon": lookahead
+            }
+            account.open_position_type = "CALL"
             account.reentries_in_window += 1
-        elif has_open and action == 4:
-            pnl = (cp - open_position["entry_price"]) / open_position["entry_price"]
-            if open_position["action"] == 2: pnl = -pnl
-            
-            train_trades += 1
-            account.equity *= (1.0 + pnl)
-            peak_equity = max(peak_equity, account.equity)
-            drawdown = (peak_equity - account.equity) / peak_equity
-            max_drawdown = max(max_drawdown, drawdown)
-
+        elif not has_open and action == 2:
+            open_position = {
+                "action": 2, "entry_price": cp, "entry_i": i, "horizon": lookahead
+            }
+            account.open_position_type = "PUT"
+            account.reentries_in_window += 1
+        elif has_open and action in (3, 4):
+            entry_p = open_position["entry_price"]
+            pnl = (cp - entry_p) / (entry_p + 1e-8)
+            if open_position["action"] == 2:
+                pnl = -pnl
             if pnl > 0:
-                train_wins += 1
-                train_win_streak += 1
-                train_loss_streak = 0
-                max_tr_win_streak = max(max_tr_win_streak, train_win_streak)
-                total_win_pnl += pnl
+                account.win_streak += 1
+                account.loss_streak = 0
             else:
-                train_losses += 1
-                train_loss_streak += 1
-                train_win_streak = 0
-                max_tr_loss_streak = max(max_tr_loss_streak, train_loss_streak)
-                total_loss_pnl += abs(pnl)
-
-            account.win_streak = train_win_streak
-            account.loss_streak = train_loss_streak
+                account.loss_streak += 1
+                account.win_streak = 0
             open_position = None
             account.open_position_type = None
+            account.open_position_pnl_pct = 0.0
             account.reentries_in_window = 0
-
-        if action == 1: reward = fwd_pct - 0.0005
-        elif action == 2: reward = -fwd_pct - 0.0005
+            action_close_pnl = float(pnl)
         else:
-            mask_allowed_entry = (action_mask[1] == 1) or (action_mask[2] == 1)
-            reward = -abs(fwd_pct) if (mask_allowed_entry and meta_score >= 0.55 and abs(fwd_pct) >= 0.0015) else 0.001
+            action_close_pnl = None
 
-        next_row = train_df.iloc[idx + lookback_bars + 1] if (idx + lookback_bars + 1) < len(train_df) else row
-        next_cp = float(next_row[close_col])
-        next_exec_ctx = _make_exec_ctx(SYMBOL, next_cp, dict(next_row), atr_col, up_vol_col, down_vol_col)
-        next_levels = detect_snr_levels_sequential(price_data_hl, up_to_index=min(row_idx_abs + 1, len(train_df) - 1),
-                                                     lookback_period=min(ZONE_LOOKBACK_PERIOD, row_idx_abs + 1),
-                                                     min_distance_pct=ZONE_MIN_DISTANCE_PCT) if row_idx_abs + 1 >= 20 else []
-        next_df_slice = price_data_hl.iloc[max(0, row_idx_abs + 1 - ZONE_LOOKBACK_PERIOD): row_idx_abs + 2]
-        next_zones = create_clustered_zones_sequential(next_levels, next_df_slice, n_clusters=min(8, max(3, len(next_levels)))) if next_levels else []
-        next_nearest_supp, next_nearest_res = get_nearest_zones(next_zones, next_cp)
+        # Reward shaping (horizon-matched)
+        if action == 1:
+            reward = fwd_pct - 0.0005
+        elif action == 2:
+            reward = -fwd_pct - 0.0005
+        elif action in (3, 4) and action_close_pnl is not None:
+            reward = float(np.clip(action_close_pnl - 0.0005, -0.05, 0.05))
+        elif action in (3, 4):
+            reward = 0.0
+        else:
+            mask_allowed = (action_mask[1] == 1) or (action_mask[2] == 1)
+            if mask_allowed and meta_score >= 0.55 and abs(fwd_pct) >= 0.0015:
+                reward = -abs(fwd_pct)  # Missed opportunity penalty
+            else:
+                reward = 0.001
+        reward = float(np.clip(reward, -0.05, 0.05))
+
+        next_i = min(i + 1, N_train - 1)
+        next_state = static_states[next_i].copy()
+        next_state[10] = account.daily_drawdown_pct
+        next_state[11] = 1.0 if account.open_position_type == "CALL" else (
+                         -1.0 if account.open_position_type == "PUT" else 0.0)
+        next_state[12] = account.open_position_pnl_pct
+        next_state[13] = account.win_streak / 10.0
+        next_state[14] = account.loss_streak / 10.0
+        next_state[22] = account.reentries_in_window / max(1, account.max_reentries_allowed)
+
         next_mask = mask_engine.get_action_mask(
-            next_cp, next_exec_ctx.atr, next_nearest_supp, next_nearest_res,
-            next_exec_ctx.buy_volume, next_exec_ctx.sell_volume, has_open_position=(open_position is not None)
+            close_prices[next_i + lookback_bars],
+            max(0.01, atr_vals[next_i + lookback_bars]),
+            nearest_supp_list[next_i], nearest_res_list[next_i],
+            up_vols[next_i + lookback_bars], dn_vols[next_i + lookback_bars],
+            has_open_position=(open_position is not None)
         )
-        next_state_vec = build_state_vector(None, bias, account, next_exec_ctx, next_nearest_supp, next_nearest_res)
 
-        replay_buffer.append((state_vec, action, reward, next_state_vec, False, next_mask))
-        if len(replay_buffer) > BUFFER_CAPACITY: replay_buffer.pop(0)
+        replay_buffer.append((state, action, reward, next_state, next_mask))
+        if len(replay_buffer) > BUFFER_CAPACITY:
+            replay_buffer.pop(0)
 
-        if len(replay_buffer) >= BATCH_SIZE_Q:
+        # Batch optimization
+        if len(replay_buffer) >= BATCH_SIZE_Q and i % 4 == 0:
             q_net.train()
             batch = random.sample(replay_buffer, BATCH_SIZE_Q)
-            st_b = torch.tensor(np.array([b[0] for b in batch]), device=device)
-            act_b = torch.tensor([b[1] for b in batch], device=device).unsqueeze(1)
-            rew_b = torch.tensor([b[2] for b in batch], device=device).unsqueeze(1)
-            next_st_b = torch.tensor(np.array([b[3] for b in batch]), device=device)
-            mask_b = torch.tensor(np.array([b[5] for b in batch]), device=device)
+            st_b   = torch.tensor(np.array([b[0] for b in batch]), dtype=torch.float32, device=device)
+            act_b  = torch.tensor([b[1] for b in batch], dtype=torch.int64, device=device).unsqueeze(1)
+            rew_b  = torch.tensor([b[2] for b in batch], dtype=torch.float32, device=device).unsqueeze(1)
+            next_b = torch.tensor(np.array([b[3] for b in batch]), dtype=torch.float32, device=device)
+            mask_b = torch.tensor(np.array([b[4] for b in batch]), dtype=torch.float32, device=device)
+
+            st_b = torch.nan_to_num(st_b, nan=0.0)
+            next_b = torch.nan_to_num(next_b, nan=0.0)
+            rew_b = torch.nan_to_num(rew_b, nan=0.0)
 
             q_vals_b = q_net(st_b).gather(1, act_b)
             with torch.no_grad():
-                next_q_pol = q_net(next_st_b)
-                masked_next_q = torch.where(mask_b == 1, next_q_pol, torch.tensor(-1e9, device=device))
-                best_next_act = masked_next_q.argmax(dim=1, keepdim=True)
-                next_q_targ = q_target(next_st_b).gather(1, best_next_act)
+                next_q_pol = q_net(next_b)
+                masked_next = torch.where(mask_b == 1, next_q_pol, torch.full_like(next_q_pol, -1e9))
+                best_act = masked_next.argmax(dim=1, keepdim=True)
+                next_q_targ = q_target(next_b).gather(1, best_act)
                 target_q = rew_b + 0.99 * next_q_targ
+                target_q = torch.nan_to_num(target_q, nan=0.0, posinf=1.0, neginf=-1.0)
 
             loss = nn.MSELoss()(q_vals_b, target_q)
+            if torch.isnan(loss):
+                continue
             q_opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(q_net.parameters(), 1.0)
@@ -1044,143 +1242,26 @@ for q_epoch in range(Q_EPOCHS):
                 for tp, p in zip(q_target.parameters(), q_net.parameters()):
                     tp.data.copy_(0.005 * p.data + 0.995 * tp.data)
             _q_loss_acc += loss.item()
+            _q_steps += 1
 
-        epsilon = max(epsilon_min, epsilon * epsilon_decay)
+    epsilon = max(epsilon_min, epsilon * epsilon_decay_per_epoch)
 
-    # ── VALIDATION TRAVERSAL (PER-EPOCH PASS OVER val_df) ──
-    val_trades, val_wins, val_losses = 0, 0, 0
-    val_win_streak, val_loss_streak = 0, 0
-    max_val_win_streak, max_val_loss_streak = 0, 0
-    val_total_win_pnl, val_total_loss_pnl = 0.0, 0.0
-    val_peak_eq, val_max_dd = 10000.0, 0.0
+    avg_l = _q_loss_acc / max(_q_steps, 1)
+    print(f"  [Q Epoch {q_epoch+1:>2}/{Q_EPOCHS}] TD Loss={avg_l:.4e} | eps={epsilon:.3f} | "
+          f"Actions: WAIT={action_counts[0]}, CALL={action_counts[1]}, PUT={action_counts[2]}, "
+          f"TP={action_counts[3]}, CLOSE={action_counts[4]}")
 
-    if N_val > 0:
-        val_account = AccountContext()
-        val_open_pos = None
-        q_net.eval()
-
-        val_hl = val_df[[open_col, high_col, low_col, close_col, vol_col]].rename(
-            columns={open_col: "Open", high_col: "High", low_col: "Low", close_col: "Close", vol_col: "Volume"}
-        )
-
-        for v_idx in range(N_val):
-            vx_seq = val_num_matrix[v_idx: v_idx + lookback_bars].flatten()
-            vx_t = torch.tensor(vx_seq, dtype=torch.float32, device=device).unsqueeze(0)
-            with torch.no_grad():
-                vq_vals, vstrength, vpips, vrisk, vliq, vreversal = net(vx_t)
-
-            v_strength_vec = vstrength.squeeze(0).cpu().numpy()
-            v_meta_score = float(v_strength_vec.mean())
-            v_row = val_df.iloc[v_idx + lookback_bars]
-            v_cp = float(v_row[close_col])
-            v_row_abs = v_idx + lookback_bars
-
-            v_exec_ctx = _make_exec_ctx(SYMBOL, v_cp, dict(v_row), atr_col, up_vol_col, down_vol_col)
-            v_bias = HTFBiasPackage(
-                direction="bullish" if v_meta_score > 0.5 else "bearish",
-                strength=v_meta_score, reversal_prob=float(vreversal.mean().item()),
-                q_value=float(vq_vals.max().item()),
-                expected_mfe_pips=float(vrisk[0, 0].item()) * 100.0 if vrisk.shape[-1] > 0 else 0.0,
-                expected_mae_pips=float(vrisk[0, 1].item()) * 100.0 if vrisk.shape[-1] > 1 else 0.0,
-                horizon_strengths=v_strength_vec.tolist(),
-            )
-
-            v_levels = detect_snr_levels_sequential(val_hl, up_to_index=v_row_abs,
-                                                    lookback_period=min(ZONE_LOOKBACK_PERIOD, v_row_abs),
-                                                    min_distance_pct=ZONE_MIN_DISTANCE_PCT) if v_row_abs >= 20 else []
-            v_slice = val_hl.iloc[max(0, v_row_abs - ZONE_LOOKBACK_PERIOD): v_row_abs + 1]
-            v_zones = create_clustered_zones_sequential(v_levels, v_slice, n_clusters=min(8, max(3, len(v_levels)))) if v_levels else []
-            v_supp, v_res = get_nearest_zones(v_zones, v_cp)
-
-            v_has_open = val_open_pos is not None
-            v_mask = mask_engine.get_action_mask(
-                v_cp, v_exec_ctx.atr, v_supp, v_res, v_exec_ctx.buy_volume, v_exec_ctx.sell_volume, has_open_position=v_has_open
-            )
-            v_state_vec = build_state_vector(None, v_bias, val_account, v_exec_ctx, v_supp, v_res)
-
-            with torch.no_grad():
-                st_v_t = torch.tensor(v_state_vec, device=device).unsqueeze(0)
-                v_q_out = q_net(st_v_t).squeeze(0).cpu().numpy()
-                v_masked_q = np.where(v_mask == 1, v_q_out, -1e9)
-                v_act = int(np.argmax(v_masked_q))
-
-            if not v_has_open and v_act in (1, 2):
-                val_open_pos = {"action": v_act, "entry_price": v_cp}
-                val_account.open_position_type = "CALL" if v_act == 1 else "PUT"
-            elif v_has_open and v_act == 4:
-                v_pnl = (v_cp - val_open_pos["entry_price"]) / val_open_pos["entry_price"]
-                if val_open_pos["action"] == 2: v_pnl = -v_pnl
-
-                val_trades += 1
-                val_account.equity *= (1.0 + v_pnl)
-                val_peak_eq = max(val_peak_eq, val_account.equity)
-                val_dd = (val_peak_eq - val_account.equity) / val_peak_eq
-                val_max_dd = max(val_max_dd, val_dd)
-
-                if v_pnl > 0:
-                    val_wins += 1
-                    val_win_streak += 1
-                    val_loss_streak = 0
-                    max_val_win_streak = max(max_val_win_streak, val_win_streak)
-                    val_total_win_pnl += v_pnl
-                else:
-                    val_losses += 1
-                    val_loss_streak += 1
-                    val_win_streak = 0
-                    max_val_loss_streak = max(max_val_loss_streak, val_loss_streak)
-                    val_total_loss_pnl += abs(v_pnl)
-
-                val_open_pos = None
-                val_account.open_position_type = None
-
-    # ── METRIC CALCULATIONS & MONEY MANAGEMENT INSIGHTS ──
-    tr_wr = (train_wins / max(train_trades, 1)) * 100.0
-    tr_lr = (train_losses / max(train_trades, 1)) * 100.0
-    val_wr = (val_wins / max(val_trades, 1)) * 100.0
-    val_lr = (val_losses / max(val_trades, 1)) * 100.0
-
-    avg_win_pnl = (val_total_win_pnl / max(val_wins, 1)) * 100.0
-    avg_loss_pnl = (val_total_loss_pnl / max(val_losses, 1)) * 100.0
-    rr_ratio = avg_win_pnl / max(avg_loss_pnl, 1e-6)
-
-    # Kelly Criterion position sizing recommendation: K% = W - (1-W)/RR
-    p_win = val_wr / 100.0
-    kelly_f = p_win - ((1.0 - p_win) / max(rr_ratio, 1e-6)) if rr_ratio > 0 else 0.0
-    rec_sizing = float(np.clip(0.5 * kelly_f * 100.0, 1.0, 25.0))  # Bounded Half-Kelly %
-
-    is_best_q = val_wr > best_val_wr and val_trades >= 5
-    if is_best_q:
-        best_val_wr = val_wr
-        best_q_weights = {k: v.cpu().clone() for k, v in q_net.state_dict().items()}
-        torch.save(q_net.state_dict(), "best_q_executor.pt")
-
-    q_ckpt_path = f"q_executor_epoch_{q_epoch+1}.pt"
-    torch.save(q_net.state_dict(), q_ckpt_path)
-
-    avg_q_td = _q_loss_acc / (N_train + 1e-8)
-    status_q = f"** NEW BEST VAL WR -> {q_ckpt_path} saved **" if is_best_q else f"saved {q_ckpt_path}"
-
-    print()
-    print(f"📊 [Q Maze Epoch {q_epoch+1:>2}/{Q_EPOCHS}] TD Loss={avg_q_td:.4e} | Epsilon={epsilon:.3f}")
-    print(f"  ├─ Train Performance : Trades={train_trades:>3} | WinRate={tr_wr:>5.1f}% ({train_wins}W/{train_losses}L) | LossRate={tr_lr:>5.1f}% | Streaks(W/L)={max_tr_win_streak}/{max_tr_loss_streak} | MaxDD={max_drawdown*100:.1f}%")
-    print(f"  ├─ Val Performance   : Trades={val_trades:>3} | WinRate={val_wr:>5.1f}% ({val_wins}W/{val_losses}L) | LossRate={val_lr:>5.1f}% | Streaks(W/L)={max_val_win_streak}/{max_val_loss_streak} | MaxDD={val_max_dd*100:.1f}% {status_q}")
-    print(f"  ├─ Money Management : AvgWin={avg_win_pnl:+.2f}% | AvgLoss=-{avg_loss_pnl:.2f}% | Risk/Reward={rr_ratio:.2f}:1 | Half-Kelly Sizing={rec_sizing:.1f}%")
-    print(f"  └─ Action Allocations: WAIT={action_counts[0]}, CALL={action_counts[1]}, PUT={action_counts[2]}, TP={action_counts[3]}, CLOSE={action_counts[4]}")
-
-    if val_wr >= TARGET_VAL_WIN_RATE and val_trades >= 10:
-        print(f"🎯 Target Validation Win Rate ({TARGET_VAL_WIN_RATE}%) achieved at Epoch {q_epoch+1}! Early stopping triggered.")
-        break
-
-if best_q_weights is not None:
-    q_net.load_state_dict(best_q_weights)
-    print(f"✅ Restored best Q-Executor checkpoint (Best Val Win Rate = {best_val_wr:.1f}%). All per-epoch weights saved as q_executor_epoch_*.pt.")
+print("Q-Executor Traversal Training Complete.")
 """
 
 CELL_PHASE3_PHASE4_EVAL = """# =============================================================================
 # 📈 PHASE 3 & 4: OUT-OF-SAMPLE TEST EVALUATION & DYNAMIC PORTFOLIO SIMULATION
+# Refactored: Recommended-horizon primary evaluation + counterfactual table + horizon gating.
 # =============================================================================
 import torch
 import torch.nn as nn
+import numpy as np
+import pandas as pd
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1191,18 +1272,194 @@ EXPIRY_HORIZONS = {
     "1h (12 bars)": 12,
 }
 
-print("\\n" + "═"*92)
-print("📊 OUT-OF-SAMPLE TEST EVALUATION ACROSS EXPIRY HORIZONS")
+print("
+" + "═"*92)
+print("📊 PRECOMPUTING OUT-OF-SAMPLE TEST STATE VECTORS & ZONES")
 print("═"*92)
-print(f"{'Expiry Horizon':<18} | {'Trades':<8} | {'Wins':<6} | {'Losses':<8} | {'Waits':<8} | {'Win Rate %':<10} | {'Max Streak [W, L]':<18}")
-print("-" * 92)
 
 test_matrix = np.nan_to_num(test_df[feature_cols].values.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
 N_test = len(test_df) - lookback_bars - 12
 q_net.eval()
 net.eval()
 
-# Phase 3: Per-Horizon Evaluation
+# 1. Precompute Meta features for test_df
+test_meta_strengths = np.zeros((N_test, 4), dtype=np.float32)
+test_meta_qmax     = np.zeros(N_test, dtype=np.float32)
+test_meta_rev      = np.zeros(N_test, dtype=np.float32)
+test_meta_mfe      = np.zeros(N_test, dtype=np.float32)
+test_meta_mae      = np.zeros(N_test, dtype=np.float32)
+
+with torch.no_grad():
+    for start in range(0, N_test, 256):
+        end = min(start + 256, N_test)
+        batch_x = np.stack([
+            test_matrix[i : i + lookback_bars].flatten()
+            for i in range(start, end)
+        ])
+        x_t = torch.tensor(batch_x, dtype=torch.float32, device=device)
+        q_vals, strength, pips, risk, liq, rev = net(x_t)
+
+        test_meta_strengths[start:end] = strength.cpu().numpy()
+        test_meta_qmax[start:end]      = q_vals.max(dim=1).values.cpu().numpy()
+        test_meta_rev[start:end]       = rev.squeeze(-1).cpu().numpy() if rev.ndim > 1 else rev.cpu().numpy()
+        if risk.shape[-1] >= 2:
+            test_meta_mfe[start:end]   = risk[:, 0].cpu().numpy()
+            test_meta_mae[start:end]   = risk[:, 1].cpu().numpy()
+
+test_meta_strengths = np.nan_to_num(test_meta_strengths, nan=0.5)
+test_meta_qmax      = np.nan_to_num(test_meta_qmax, nan=0.5)
+test_meta_rev       = np.nan_to_num(test_meta_rev, nan=0.2)
+test_meta_mfe       = np.nan_to_num(test_meta_mfe, nan=0.5)
+test_meta_mae       = np.nan_to_num(test_meta_mae, nan=0.15)
+
+# 2. Precompute SNR zones for test_df
+test_price_data_hl = test_df[[open_col, high_col, low_col, close_col, vol_col]].rename(
+    columns={open_col: "Open", high_col: "High", low_col: "Low", close_col: "Close", vol_col: "Volume"}
+)
+test_close_prices = test_df[close_col].values.astype(np.float64)
+test_atr_vals     = test_df[atr_col].values.astype(np.float64) if atr_col else (test_close_prices * 0.005)
+test_up_vols      = test_df[up_vol_col].values.astype(np.float64) if up_vol_col else np.zeros(len(test_df))
+test_dn_vols      = test_df[down_vol_col].values.astype(np.float64) if down_vol_col else np.zeros(len(test_df))
+
+test_nearest_supp = [None] * N_test
+test_nearest_res  = [None] * N_test
+
+last_test_zones = []
+for i in range(N_test):
+    abs_idx = i + lookback_bars
+    if i % 5 == 0 or not last_test_zones:
+        lb = min(ZONE_LOOKBACK_PERIOD, abs_idx)
+        levels = detect_snr_levels_sequential(
+            test_price_data_hl, up_to_index=abs_idx,
+            lookback_period=lb, min_distance_pct=ZONE_MIN_DISTANCE_PCT
+        ) if abs_idx >= 20 else []
+        df_slice = test_price_data_hl.iloc[max(0, abs_idx - ZONE_LOOKBACK_PERIOD): abs_idx + 1]
+        last_test_zones = create_clustered_zones_sequential(
+            levels, df_slice, n_clusters=min(8, max(3, len(levels)))
+        ) if levels else []
+    ns, nr = get_nearest_zones(last_test_zones, test_close_prices[abs_idx])
+    test_nearest_supp[i] = ns
+    test_nearest_res[i]  = nr
+
+# 3. Build 28-dim Static States for test_df (Recommended Horizon Indexed)
+test_static_states = np.zeros((N_test, 28), dtype=np.float32)
+for i in range(N_test):
+    abs_idx = i + lookback_bars
+    row = test_df.iloc[abs_idx]
+    cp  = test_close_prices[abs_idx]
+    atr = max(0.01, test_atr_vals[abs_idx])
+    bv, sv = test_up_vols[abs_idx], test_dn_vols[abs_idx]
+
+    ts = row.get("timestamp", None)
+    hour_f, dow, phase = 14.5, 1, "off_hours"
+    if ts is not None:
+        try:
+            ts_pd = pd.Timestamp(ts)
+            if ts_pd.tzinfo is None:
+                ts_pd = ts_pd.tz_localize("UTC")
+            ts_et = ts_pd.tz_convert("America/New_York")
+            hour_f = ts_et.hour + ts_et.minute / 60.0
+            dow = ts_et.dayofweek
+            if 9.5 <= hour_f < 10.5:
+                phase = "nyse_open"
+            elif 15.0 <= hour_f < 16.0:
+                phase = "nyse_power_hour"
+            elif 9.5 <= hour_f < 16.0:
+                phase = "regular_hours"
+        except Exception:
+            pass
+
+    strength_vec = test_meta_strengths[i]
+    opt_h = int(np.argmax(strength_vec))
+    meta_score = float(strength_vec[opt_h])  # Recommended horizon strength
+    dir_flag = 1.0 if meta_score > 0.5 else (-1.0 if meta_score < 0.5 else 0.0)
+    hs = strength_vec.tolist()
+
+    ns = test_nearest_supp[i]
+    nr = test_nearest_res[i]
+    supp_dist = abs(cp - ns["price_level"]) / cp if ns else 1.0
+    res_dist  = abs(cp - nr["price_level"]) / cp if nr else 1.0
+    supp_vol_ratio = ns["volume_delta_ratio"] if ns else 0.0
+    res_vol_ratio  = nr["volume_delta_ratio"] if nr else 0.0
+    total_vol = bv + sv
+    vol_delta_ratio = (bv - sv) / (total_vol + 1e-6)
+
+    sin_hour = np.sin(2 * np.pi * hour_f / 24.0)
+    cos_hour = np.cos(2 * np.pi * hour_f / 24.0)
+    dow_norm = dow / 6.0
+    is_nyse_open = 1.0 if phase == "nyse_open" else 0.0
+    is_power_hour = 1.0 if phase == "nyse_power_hour" else 0.0
+
+    test_static_states[i] = [
+        dir_flag, meta_score, float(test_meta_rev[i]), float(test_meta_qmax[i]),
+        float(test_meta_mfe[i]), float(test_meta_mae[i]),
+        hs[0], hs[1], hs[2], hs[3],
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        atr / cp, supp_dist, res_dist,
+        supp_vol_ratio, res_vol_ratio, vol_delta_ratio,
+        0.0,
+        sin_hour, cos_hour, dow_norm, is_nyse_open, is_power_hour,
+    ]
+
+test_static_states = np.nan_to_num(test_static_states, nan=0.0, posinf=0.0, neginf=0.0)
+mask_engine = HardActionMask()
+
+print("
+" + "═"*92)
+print("📊 PHASE 3a: PRIMARY RECOMMENDED-HORIZON TEST EVALUATION")
+print("═"*92)
+print(f"{'Mode':<22} | {'Trades':<8} | {'Wins':<6} | {'Losses':<8} | {'Waits':<8} | {'Win Rate %':<10}")
+print("-" * 80)
+
+wins_rec = losses_rec = waits_rec = 0
+open_until_rec = -1
+for idx in range(N_test):
+    if idx < open_until_rec:
+        continue
+    abs_idx = idx + lookback_bars
+    strength_vec = test_meta_strengths[idx]
+    rec_h = int(np.argmax(strength_vec))
+    lookahead_bars = list(EXPIRY_HORIZONS.values())[rec_h]
+    if abs_idx + lookahead_bars >= len(test_df):
+        continue
+
+    cp = test_close_prices[abs_idx]
+    exp_cp = test_close_prices[abs_idx + lookahead_bars]
+    state = test_static_states[idx].copy()
+    mask = mask_engine.get_action_mask(
+        cp, max(0.01, test_atr_vals[abs_idx]),
+        test_nearest_supp[idx], test_nearest_res[idx],
+        test_up_vols[abs_idx], test_dn_vols[abs_idx],
+        has_open_position=False,
+    )
+    with torch.no_grad():
+        st_t = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+        logits = q_net(st_t).squeeze(0).cpu().numpy()
+        action = int(np.argmax(np.where(mask == 1, logits, -1e9)))
+
+    if action == 1:
+        open_until_rec = idx + lookahead_bars
+        if exp_cp > cp: wins_rec += 1
+        else: losses_rec += 1
+    elif action == 2:
+        open_until_rec = idx + lookahead_bars
+        if exp_cp < cp: wins_rec += 1
+        else: losses_rec += 1
+    else:
+        waits_rec += 1
+
+tot_rec = wins_rec + losses_rec
+wr_rec = (100.0 * wins_rec / tot_rec) if tot_rec else 0.0
+print(f"{'Recommended Horizon':<22} | {tot_rec:<8} | {wins_rec:<6} | {losses_rec:<8} | {waits_rec:<8} | {wr_rec:<10.2f}%")
+
+print("
+" + "═"*92)
+print("📊 PHASE 3b: COUNTERFACTUAL PER-HORIZON TEST EVALUATION")
+print("═"*92)
+print(f"{'Expiry Horizon':<18} | {'Trades':<8} | {'Wins':<6} | {'Losses':<8} | {'Waits':<8} | {'Win Rate %':<10} | {'Max Streak [W, L]':<18}")
+print("-" * 92)
+
+# Counterfactual Per-Horizon Evaluation
 for exp_label, lookahead_bars in EXPIRY_HORIZONS.items():
     wins, losses, waits = 0, 0, 0
     cur_w_streak, cur_l_streak = 0, 0
@@ -1213,42 +1470,39 @@ for exp_label, lookahead_bars in EXPIRY_HORIZONS.items():
         if idx < open_until:
             continue
 
-        x_seq = test_matrix[idx : idx + lookback_bars].flatten()
-        x_t = torch.tensor(x_seq, dtype=torch.float32, device=device).unsqueeze(0)
+        abs_idx = idx + lookback_bars
+        if abs_idx + lookahead_bars >= len(test_df):
+            continue
+
+        cp = test_close_prices[abs_idx]
+        exp_cp = test_close_prices[abs_idx + lookahead_bars]
+
+        state = test_static_states[idx].copy()
+        mask = mask_engine.get_action_mask(
+            cp, max(0.01, test_atr_vals[abs_idx]),
+            test_nearest_supp[idx], test_nearest_res[idx],
+            test_up_vols[abs_idx], test_dn_vols[abs_idx],
+            has_open_position=False
+        )
 
         with torch.no_grad():
-            q_vals, strength, pips, risk, liq, rev = net(x_t)
-
-        meta_score = float(strength.mean().item())
-        row = test_df.iloc[idx + lookback_bars]
-        exp_row = test_df.iloc[idx + lookback_bars + lookahead_bars]
-
-        cp = float(row[close_col])
-        exp_cp = float(exp_row[close_col])
-
-        st_vec = np.zeros((1, 28), dtype=np.float32)
-        st_vec[0, 0] = meta_score
-
-        with torch.no_grad():
-            act_logits = q_net(torch.tensor(st_vec, device=device))
-            action = int(act_logits.argmax(dim=-1).item())
+            st_t = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+            logits = q_net(st_t).squeeze(0).cpu().numpy()
+            masked_logits = np.where(mask == 1, logits, -1e9)
+            action = int(np.argmax(masked_logits))
 
         if action == 1:  # BUY_CALL
             open_until = idx + lookahead_bars
             if exp_cp > cp:
-                wins += 1
-                cur_w_streak += 1; cur_l_streak = 0
+                wins += 1; cur_w_streak += 1; cur_l_streak = 0
             else:
-                losses += 1
-                cur_l_streak += 1; cur_w_streak = 0
+                losses += 1; cur_l_streak += 1; cur_w_streak = 0
         elif action == 2:  # BUY_PUT
             open_until = idx + lookahead_bars
             if exp_cp < cp:
-                wins += 1
-                cur_w_streak += 1; cur_l_streak = 0
+                wins += 1; cur_w_streak += 1; cur_l_streak = 0
             else:
-                losses += 1
-                cur_l_streak += 1; cur_w_streak = 0
+                losses += 1; cur_l_streak += 1; cur_w_streak = 0
         else:
             waits += 1
 
@@ -1260,7 +1514,8 @@ for exp_label, lookahead_bars in EXPIRY_HORIZONS.items():
     print(f"{exp_label:<18} | {tot:<8} | {wins:<6} | {losses:<8} | {waits:<8} | {wr:<10.2f} | W:{max_w_streak} / L:{max_l_streak}")
 
 # Phase 4: Dynamic Collective Multi-Horizon Concurrent Portfolio Simulation
-print("\\n" + "═"*92)
+print("
+" + "═"*92)
 print("📊 DYNAMIC COLLECTIVE MULTI-HORIZON CONCURRENT PORTFOLIO SIMULATION")
 print("═"*92)
 print("Policy: Max 1 active trade per horizon concurrently from shared account.")
@@ -1278,41 +1533,43 @@ _p_cur_ws, _p_cur_ls = 0, 0
 recommended_matches = 0
 
 for idx in range(N_test):
-    x_seq = test_matrix[idx : idx + lookback_bars].flatten()
-    x_t = torch.tensor(x_seq, dtype=torch.float32, device=device).unsqueeze(0)
+    abs_idx = idx + lookback_bars
+    cp = test_close_prices[abs_idx]
 
-    with torch.no_grad():
-        q_vals, strength, pips, risk, liq, rev = net(x_t)
-
-    meta_score = float(strength.mean().item())
-    rec_horizon_idx = int(strength.argmax(dim=-1).item())
-
-    row = test_df.iloc[idx + lookback_bars]
-    cur_price = float(row[close_col])
+    strength_vec = test_meta_strengths[idx]
+    rec_horizon_idx = int(np.argmax(strength_vec))
 
     for h_idx, (exp_label, lookahead_bars) in enumerate(EXPIRY_HORIZONS.items()):
+        if h_idx != rec_horizon_idx:
+            continue   # Only trade the meta-recommended expiry horizon
+
         if idx < active_horizon_until[exp_label]:
             continue
 
-        if idx + lookback_bars + lookahead_bars >= len(test_df):
+        if abs_idx + lookahead_bars >= len(test_df):
             continue
 
-        expiry_row = test_df.iloc[idx + lookback_bars + lookahead_bars]
-        expiry_price = float(expiry_row[close_col])
+        expiry_price = test_close_prices[abs_idx + lookahead_bars]
 
-        st_vec = np.zeros((1, 28), dtype=np.float32)
-        st_vec[0, 0] = meta_score
-        st_vec[0, 1] = float(rev.mean().item())
+        state = test_static_states[idx].copy()
+        mask = mask_engine.get_action_mask(
+            cp, max(0.01, test_atr_vals[abs_idx]),
+            test_nearest_supp[idx], test_nearest_res[idx],
+            test_up_vols[abs_idx], test_dn_vols[abs_idx],
+            has_open_position=False
+        )
 
         with torch.no_grad():
-            act_logits = q_net(torch.tensor(st_vec, device=device))
-            action = int(act_logits.argmax(dim=-1).item())
+            st_t = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+            logits = q_net(st_t).squeeze(0).cpu().numpy()
+            masked_logits = np.where(mask == 1, logits, -1e9)
+            action = int(np.argmax(masked_logits))
 
         outcome = None
         if action == 1:  # BUY_CALL
-            outcome = 1 if expiry_price > cur_price else 0
+            outcome = 1 if expiry_price > cp else 0
         elif action == 2:  # BUY_PUT
-            outcome = 1 if expiry_price < cur_price else 0
+            outcome = 1 if expiry_price < cp else 0
 
         if outcome is not None:
             active_horizon_until[exp_label] = idx + lookahead_bars
