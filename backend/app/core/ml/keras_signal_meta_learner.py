@@ -433,6 +433,8 @@ class KerasSignalMetaLearner:
         else:
             arr = np.asarray(feature_dict_or_array, dtype=np.float32)
 
+        arr = np.nan_to_num(arr, nan=0.0, posinf=1e6, neginf=-1e6)
+
         target = self.lookback_bars * self.num_features
         if arr.ndim == 1:
             if arr.size != target:
@@ -483,6 +485,9 @@ class KerasSignalMetaLearner:
         bull_label = (bdir == 2).astype(np.float32).reshape(-1, 1)
         bear_label = (bdir == 0).astype(np.float32).reshape(-1, 1)
 
+        if not np.all(np.isfinite(bx)):
+            return {"loss": 0.0, "loss_q": 0.0, "loss_strength": 0.0, "loss_pips": 0.0, "loss_risk": 0.0, "loss_liquidity": 0.0, "loss_reversal": 0.0, "loss_aux1": 0.0, "loss_aux2": 0.0, "buffer_size": len(self._buf_x)}
+
         with tf.GradientTape() as tape:
             preds = self.model(bx, training=True)
 
@@ -524,6 +529,9 @@ class KerasSignalMetaLearner:
                     + 0.2  * loss_bull
                     + 0.2  * loss_bear
                     + 0.15 * loss_aux)
+
+            if not tf.math.is_finite(loss):
+                return {"loss": 0.0, "loss_q": 0.0, "loss_strength": 0.0, "loss_pips": 0.0, "loss_risk": 0.0, "loss_liquidity": 0.0, "loss_reversal": 0.0, "loss_aux1": 0.0, "loss_aux2": 0.0, "buffer_size": len(self._buf_x)}
 
         grads = tape.gradient(loss, self.model.trainable_variables)
         valid_grads_and_vars = [

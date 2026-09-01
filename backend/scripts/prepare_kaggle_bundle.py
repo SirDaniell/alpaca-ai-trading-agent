@@ -15,6 +15,7 @@ Generates standalone, self-contained Jupyter Notebooks for PyTorch Kaggle GPU ex
 import os
 import json
 import zipfile
+import re
 
 DATA_DIR = "data"
 BUNDLE_ZIP_PATH = os.path.join(DATA_DIR, "axe_meta_dataset.zip")
@@ -80,14 +81,14 @@ if zip_files:
         target_extract = '/kaggle/working/data' if os.path.exists('/kaggle/working') else 'data'
         zip_ref.extractall(target_extract)
     data_dir = target_extract
-elif os.path.exists('data/train_40k.csv'):
+elif os.path.exists('data/train_50k.csv'):
     data_dir = 'data'
 else:
     data_dir = KAGGLE_DATASET_DIR
 
-train_csv = os.path.join(data_dir, 'train_40k.csv')
-val_csv   = os.path.join(data_dir, 'val_40k.csv')
-test_csv  = os.path.join(data_dir, 'test_40k.csv')
+train_csv = os.path.join(data_dir, 'train_50k.csv')
+val_csv   = os.path.join(data_dir, 'val_50k.csv')
+test_csv  = os.path.join(data_dir, 'test_50k.csv')
 
 if os.path.exists(train_csv):
     train_df = pd.read_csv(train_csv)
@@ -441,13 +442,15 @@ CELL_PYTORCH_MODELS = """# =====================================================
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from typing import Dict, List, Optional, Tuple, Any, Union
 
-feature_cols = [c for c in train_df.columns if c not in ("timestamp", "Time") and not "target" in c and not "forward" in c]
+feature_cols = [c for c in train_df.columns if c not in ("timestamp", "Time") and not "target" in c and not "forward" in c and not "adv_target" in c]
 num_features = len(feature_cols)
-lookback_bars = 1000  # 100% Parity with in-house SIGNAL_META_LOOKBACK_BARS = 1000
-input_dim = lookback_bars * num_features
+meta_lookback_bars = 150
+q_lookback_bars = 300
+input_dim = meta_lookback_bars * num_features
 
-print(f"📊 Feature Input Contract: {num_features} columns | Lookback {lookback_bars} bars → Flattened Dim = {input_dim}")
+print(f"📊 Feature Input Contract: {num_features} columns | Lookback {meta_lookback_bars} bars → Flattened Dim = {input_dim}")
 
 class SignalMetaNetwork(nn.Module):
     def __init__(self, input_dim: int = input_dim, num_actions: int = 4, hidden_dim: int = 128, num_features: int = num_features):
@@ -495,21 +498,46 @@ class SignalMetaNetwork(nn.Module):
         )
         self.fusion_selector = nn.Linear(hidden_dim, 4)
 
-        # Auxiliary Private Projections (Zero Gradient Interference via feat.detach())
+        # Auxiliary Private Projections (Zero Gradient Interference)
         _aux_in = 64 + 32 + 32
         self.branch_ln = nn.LayerNorm(_aux_in)
+
         self.pips_proj = nn.Linear(_aux_in, 32)
         self.pips_ln   = nn.LayerNorm(32)
-        self.pips_head = nn.Sequential(nn.SiLU(), nn.Linear(32, 16), nn.SiLU(), nn.Linear(16, 4))
+        self.pips_head = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(32, 16),
+            nn.SiLU(),
+            nn.Linear(16, 4),
+        )
+
         self.risk_proj = nn.Linear(_aux_in, 32)
         self.risk_ln   = nn.LayerNorm(32)
-        self.risk_head = nn.Sequential(nn.SiLU(), nn.Linear(32, 16), nn.SiLU(), nn.Linear(16, 8))
-        self.liq_proj  = nn.Linear(_aux_in, 16)
-        self.liq_ln    = nn.LayerNorm(16)
-        self.liquidity_head = nn.Sequential(nn.SiLU(), nn.Linear(16, 8), nn.SiLU(), nn.Linear(8, 2))
-        self.rev_proj  = nn.Linear(_aux_in, 16)
-        self.rev_ln    = nn.LayerNorm(16)
-        self.reversal_head = nn.Sequential(nn.SiLU(), nn.Linear(16, 8), nn.SiLU(), nn.Linear(8, 1), nn.Sigmoid())
+        self.risk_head = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(32, 16),
+            nn.SiLU(),
+            nn.Linear(16, 8),
+        )
+
+        self.liq_proj = nn.Linear(_aux_in, 16)
+        self.liq_ln   = nn.LayerNorm(16)
+        self.liquidity_head = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(16, 8),
+            nn.SiLU(),
+            nn.Linear(8, 2),
+        )
+
+        self.rev_proj = nn.Linear(_aux_in, 16)
+        self.rev_ln   = nn.LayerNorm(16)
+        self.reversal_head = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(16, 8),
+            nn.SiLU(),
+            nn.Linear(8, 1),
+            nn.Sigmoid(),
+        )
 
     def _prepare_3d(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim == 2:
@@ -536,14 +564,14 @@ class SignalMetaNetwork(nn.Module):
         b1_gap  = torch.mean(b1_lstm_out, dim=1)
         b1_out  = torch.cat([b1_last, b1_gap], dim=-1)
 
-        # Branch 2 (50% slice)
+        # Branch 2
         half = max(1, t // 2)
         x_mid_trans = x_trans[:, :, -half:]
         b2_c = self.b2_act(self.b2_bn(self.b2_conv(x_mid_trans)))
         b2_gap = torch.mean(b2_c, dim=-1)
         b2_out = torch.relu(self.b2_fc(b2_gap))
 
-        # Branch 3 (30% slice)
+        # Branch 3
         recent = max(1, int(t * 0.3))
         x_rec_trans = x_trans[:, :, -recent:]
         b3_c = self.b3_act(self.b3_bn(self.b3_conv(x_rec_trans)))
@@ -566,11 +594,12 @@ class SignalMetaNetwork(nn.Module):
         selector_logits = self.fusion_selector(feat)
 
         # Private Aux Heads on detached branch concatenation
-        branch_cat = torch.cat([b1_out, b2_out, b3_out], dim=-1).detach()
-        pips      = self.pips_head(torch.relu(self.pips_proj(branch_cat)))
-        risk      = self.risk_head(torch.relu(self.risk_proj(branch_cat)))
-        liquidity = self.liquidity_head(torch.relu(self.liq_proj(branch_cat)))
-        reversal  = self.reversal_head(torch.relu(self.rev_proj(branch_cat)))
+        branch_cat = self.branch_ln(torch.cat([b1_out, b2_out, b3_out], dim=-1).detach())
+
+        pips      = self.pips_head(self.pips_ln(self.pips_proj(branch_cat)))
+        risk      = self.risk_head(self.risk_ln(self.risk_proj(branch_cat)))
+        liquidity = self.liquidity_head(self.liq_ln(self.liq_proj(branch_cat)))
+        reversal  = self.reversal_head(self.rev_ln(self.rev_proj(branch_cat)))
 
         if return_aux:
             return q_vals, strength, pips, risk, liquidity, reversal, aux1, aux2, selector_logits
@@ -578,67 +607,99 @@ class SignalMetaNetwork(nn.Module):
 
 
 class ExecutorQNetwork(nn.Module):
-    def __init__(self, input_dim: int = 28, hidden_dim: int = 64, num_actions: int = 5):
+    def __init__(
+        self,
+        num_features: int = num_features,
+        input_dim: int = 28,
+        hidden_dim: int = 128,
+        num_actions: int = 5,
+        ctx_dim: int = 28,
+        q_lookback: int = q_lookback_bars,
+        num_horizons: int = 4,
+        num_head_actions: int = 3,
+    ):
         super().__init__()
-        # Branch 1: Dense Feature Tower
-        self.b1_fc1 = nn.Linear(input_dim, hidden_dim)
+        self.num_features = num_features
+        self.ctx_dim = ctx_dim
+        self.q_lookback = q_lookback
+        self.num_horizons = num_horizons
+
+        # --- Branch A: full indicators (B, T, F) -> Conv1D ---
+        self.feat_conv1 = nn.Conv1d(num_features, 64, kernel_size=3, padding=1)
+        self.feat_bn1   = nn.BatchNorm1d(64)
+        self.feat_conv2 = nn.Conv1d(64, 64, kernel_size=3, padding=1)
+        self.feat_bn2   = nn.BatchNorm1d(64)
+        self.feat_pool  = nn.AdaptiveAvgPool1d(1)
+        self.feat_fc    = nn.Linear(64, 64)
+
+        # --- Branch B: 28-dim context dense encoder ---
+        self.b1_fc1 = nn.Linear(ctx_dim, hidden_dim)
         self.b1_ln1 = nn.LayerNorm(hidden_dim)
-        self.b1_act1 = nn.SiLU()
-        self.b1_drop = nn.Dropout(0.0)
-        self.b1_fc2 = nn.Linear(hidden_dim, 32)
-        self.b1_ln2 = nn.LayerNorm(32)
-        self.b1_act2 = nn.SiLU()
+        self.b1_fc2 = nn.Linear(hidden_dim, 64)
+        self.b1_ln2 = nn.LayerNorm(64)
 
-        # Branch 2: Multi-Scale Grouped Feature Tower
-        self.b2_meta = nn.Linear(10, 16)
-        self.b2_risk = nn.Linear(5, 16)
-        self.b2_zone = nn.Linear(8, 16)
-        self.b2_time = nn.Linear(5, 16)
-        self.b2_fusion = nn.Linear(64, 32)
-        self.b2_ln = nn.LayerNorm(32)
-        self.b2_act = nn.SiLU()
+        self.b2_meta   = nn.Linear(10, 16)
+        self.b2_risk   = nn.Linear(5, 16)
+        self.b2_zone   = nn.Linear(8, 16)
+        self.b2_time   = nn.Linear(5, 16)
+        self.b2_fusion = nn.Linear(64, 64)
+        self.b2_ln     = nn.LayerNorm(64)
 
-        # Auxiliary Supervised Heads
-        self.aux1_head = nn.Linear(32, num_actions)
-        self.aux2_head = nn.Linear(32, num_actions)
+        # --- Fusion + per-horizon heads ---
+        self.fusion_fc = nn.Linear(64 + 64 + 64, hidden_dim)
+        self.fusion_ln = nn.LayerNorm(hidden_dim)
 
-        # Gated Ensemble Fusion Head
-        self.fusion_fc1 = nn.Linear(32 + 32 + num_actions + num_actions, hidden_dim)
-        self.fusion_ln1 = nn.LayerNorm(hidden_dim)
-        self.fusion_act1 = nn.SiLU()
-        self.fusion_out = nn.Linear(hidden_dim, num_actions)
+        self.horizon_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim, 64),
+                nn.LayerNorm(64),
+                nn.SiLU(),
+                nn.Linear(64, num_head_actions),
+            )
+            for _ in range(num_horizons)
+        ])
 
-    def forward(self, x: torch.Tensor, return_aux: bool = False):
-        # Branch 1
-        b1 = self.b1_act1(self.b1_ln1(self.b1_fc1(x)))
-        b1 = self.b1_drop(b1)
-        b1_out = self.b1_act2(self.b1_ln2(self.b1_fc2(b1)))
+    def _encode_feat(self, feat_window: torch.Tensor) -> torch.Tensor:
+        x = feat_window.transpose(1, 2)
+        x = torch.nn.functional.silu(self.feat_bn1(self.feat_conv1(x)))
+        x = torch.nn.functional.silu(self.feat_bn2(self.feat_conv2(x)))
+        x = self.feat_pool(x).squeeze(-1)
+        return torch.nn.functional.silu(self.feat_fc(x))
 
-        # Branch 2 (Grouped features)
-        meta_feats = x[:, :10]
-        risk_feats = x[:, 10:15]
-        zone_feats = x[:, 15:23]
-        time_feats = x[:, 23:28]
+    def _encode_ctx(self, ctx: torch.Tensor):
+        b1     = torch.nn.functional.silu(self.b1_ln1(self.b1_fc1(ctx)))
+        b1_out = torch.nn.functional.silu(self.b1_ln2(self.b1_fc2(b1)))
 
-        b2_m = torch.relu(self.b2_meta(meta_feats))
-        b2_r = torch.relu(self.b2_risk(risk_feats))
-        b2_z = torch.relu(self.b2_zone(zone_feats))
-        b2_t = torch.relu(self.b2_time(time_feats))
-        b2_cat = torch.cat([b2_m, b2_r, b2_z, b2_t], dim=-1)
-        b2_out = self.b2_act(self.b2_ln(self.b2_fusion(b2_cat)))
+        meta_f = ctx[:, :10]
+        risk_f = ctx[:, 10:15]
+        zone_f = ctx[:, 15:23]
+        time_f = ctx[:, 23:28]
+        b2_cat = torch.cat([
+            torch.relu(self.b2_meta(meta_f)),
+            torch.relu(self.b2_risk(risk_f)),
+            torch.relu(self.b2_zone(zone_f)),
+            torch.relu(self.b2_time(time_f)),
+        ], dim=-1)
+        b2_out = torch.nn.functional.silu(self.b2_ln(self.b2_fusion(b2_cat)))
+        return b1_out, b2_out
 
-        # Aux heads (detached)
-        aux1_q = self.aux1_head(b1_out.detach())
-        aux2_q = self.aux2_head(b2_out.detach())
-
-        # Gated Fusion
-        fusion_in = torch.cat([b1_out, b2_out, aux1_q.detach(), aux2_q.detach()], dim=-1)
-        fused = self.fusion_act1(self.fusion_ln1(self.fusion_fc1(fusion_in)))
-        q_final = self.fusion_out(fused)
-
-        if return_aux:
-            return q_final, aux1_q, aux2_q
-        return q_final
+    def forward(
+        self,
+        feat_window: torch.Tensor,
+        ctx: torch.Tensor,
+        horizon_idx: Optional[int] = None,
+        return_aux: bool = False,
+    ):
+        feat_h         = self._encode_feat(feat_window)
+        b1_out, b2_out = self._encode_ctx(ctx)
+        shared = torch.nn.functional.silu(
+            self.fusion_ln(
+                self.fusion_fc(torch.cat([feat_h, b1_out, b2_out], dim=-1))
+            )
+        )
+        if horizon_idx is not None:
+            return self.horizon_heads[int(horizon_idx)](shared)
+        return torch.stack([h(shared) for h in self.horizon_heads], dim=1)
 
 print("✅ PyTorch Production Models Defined: SignalMetaNetwork & ExecutorQNetwork (100% 1:1 Match)")
 """
@@ -848,9 +909,11 @@ if best_meta_weights is not None:
 """
 
 CELL_PHASE2_Q_TRAINING = """# =============================================================================
-# PHASE 2: PRECOMPUTE META + ZONES, THEN FAST SEQUENTIAL Q-LEARNING
-# Refactored: Multi-head meta feature caching, option auto-settlement,
-# live unrealized PnL state tracking, real close rewards, mask-guided Q-learning.
+# PHASE 2: PER-HORIZON Q-LEARNING
+# Architecture: 4 independent Q-heads (one per horizon), each with 3 actions
+#               WAIT(0) / CALL(1) / PUT(2). Auto-expiry handles settlement.
+# Gate: max 1 open position per horizon simultaneously.
+# Training: each horizon's head is supervised only by that horizon's reward signal.
 # =============================================================================
 import torch
 import torch.nn as nn
@@ -865,39 +928,35 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 n_gpus = torch.cuda.device_count()
 print(f"GPUs available: {n_gpus}")
 
-HORIZON_BARS_LIST = [1, 3, 6, 12]  # 5m, 15m, 30m, 1h
+HORIZON_BARS_LIST = [1, 3, 6, 12]       # 5m, 15m, 30m, 1h
+HORIZON_LABELS    = ["5m", "15m", "30m", "1h"]
+NUM_HORIZONS      = 4
+H_WAIT, H_CALL, H_PUT = 0, 1, 2         # Per-head action indices
 
-# ---------- 1. Wrap meta-net for multi-GPU inference ----------
 net.eval()
 if n_gpus > 1:
     meta_dp = DataParallel(net)
-    print("Meta-learner wrapped with DataParallel across", n_gpus, "GPUs")
 else:
     meta_dp = net
 
-# ---------- 2. Precompute meta outputs in large batches ----------
+# ---------- Precompute meta outputs ----------
 PRECOMPUTE_BATCH = 256
 N_train = len(train_df) - lookback_bars - 12
-
-print(f"[Precompute] Meta features for {N_train} steps (batch={PRECOMPUTE_BATCH})...")
+print(f"[Precompute] Meta features for {N_train} steps...")
 t0 = time.time()
 
 meta_strengths = np.zeros((N_train, 4), dtype=np.float32)
-meta_qmax     = np.zeros(N_train, dtype=np.float32)
-meta_rev      = np.zeros(N_train, dtype=np.float32)
-meta_mfe      = np.zeros(N_train, dtype=np.float32)
-meta_mae      = np.zeros(N_train, dtype=np.float32)
+meta_qmax      = np.zeros(N_train, dtype=np.float32)
+meta_rev       = np.zeros(N_train, dtype=np.float32)
+meta_mfe       = np.zeros(N_train, dtype=np.float32)
+meta_mae       = np.zeros(N_train, dtype=np.float32)
 
 with torch.no_grad():
     for start in range(0, N_train, PRECOMPUTE_BATCH):
         end = min(start + PRECOMPUTE_BATCH, N_train)
-        batch_x = np.stack([
-            train_num_matrix[i : i + lookback_bars].flatten()
-            for i in range(start, end)
-        ])
+        batch_x = np.stack([train_num_matrix[i: i + lookback_bars].flatten() for i in range(start, end)])
         x_t = torch.tensor(batch_x, dtype=torch.float32, device=device)
         q_vals, strength, pips, risk, liq, rev = meta_dp(x_t)
-        
         meta_strengths[start:end] = strength.cpu().numpy()
         meta_qmax[start:end]      = q_vals.max(dim=1).values.cpu().numpy()
         meta_rev[start:end]       = rev.squeeze(-1).cpu().numpy() if rev.ndim > 1 else rev.cpu().numpy()
@@ -908,87 +967,66 @@ with torch.no_grad():
             print(f"  meta precompute {end}/{N_train}")
 
 meta_strengths = np.nan_to_num(meta_strengths, nan=0.5, posinf=1.0, neginf=0.0)
-meta_qmax      = np.nan_to_num(meta_qmax, nan=0.5, posinf=1.0, neginf=0.0)
-meta_rev       = np.nan_to_num(meta_rev, nan=0.2, posinf=1.0, neginf=0.0)
-meta_mfe       = np.nan_to_num(meta_mfe, nan=0.5, posinf=10.0, neginf=0.0)
-meta_mae       = np.nan_to_num(meta_mae, nan=0.15, posinf=10.0, neginf=0.0)
-
+meta_qmax      = np.nan_to_num(meta_qmax, nan=0.5)
+meta_rev       = np.nan_to_num(meta_rev, nan=0.2)
+meta_mfe       = np.nan_to_num(meta_mfe, nan=0.5)
+meta_mae       = np.nan_to_num(meta_mae, nan=0.15)
 print(f"Meta precompute done in {time.time()-t0:.1f}s")
 
-# ---------- 3. Precompute zones + nearest support/resistance ----------
+# ---------- Precompute zones ----------
 print("[Precompute] SNR zones...")
 t1 = time.time()
-
 price_data_hl = train_df[[open_col, high_col, low_col, close_col, vol_col]].rename(
-    columns={open_col: "Open", high_col: "High", low_col: "Low",
-             close_col: "Close", vol_col: "Volume"}
-)
-
+    columns={open_col: "Open", high_col: "High", low_col: "Low", close_col: "Close", vol_col: "Volume"})
 nearest_supp_list = [None] * N_train
 nearest_res_list  = [None] * N_train
 close_prices = train_df[close_col].values.astype(np.float64)
-atr_vals = train_df[atr_col].values.astype(np.float64) if atr_col else (close_prices * 0.005)
+atr_vals = train_df[atr_col].values.astype(np.float64) if atr_col else close_prices * 0.005
 up_vols  = train_df[up_vol_col].values.astype(np.float64) if up_vol_col else np.zeros(len(train_df))
 dn_vols  = train_df[down_vol_col].values.astype(np.float64) if down_vol_col else np.zeros(len(train_df))
 
-ZONE_STRIDE = 5
 last_zones = []
 for i in range(N_train):
     abs_idx = i + lookback_bars
-    if i % ZONE_STRIDE == 0 or not last_zones:
+    if i % 5 == 0 or not last_zones:
         lb = min(ZONE_LOOKBACK_PERIOD, abs_idx)
-        levels = detect_snr_levels_sequential(
-            price_data_hl, up_to_index=abs_idx,
-            lookback_period=lb, min_distance_pct=ZONE_MIN_DISTANCE_PCT
-        ) if abs_idx >= 20 else []
+        levels = detect_snr_levels_sequential(price_data_hl, up_to_index=abs_idx, lookback_period=lb, min_distance_pct=ZONE_MIN_DISTANCE_PCT) if abs_idx >= 20 else []
         df_slice = price_data_hl.iloc[max(0, abs_idx - ZONE_LOOKBACK_PERIOD): abs_idx + 1]
-        last_zones = create_clustered_zones_sequential(
-            levels, df_slice, n_clusters=min(8, max(3, len(levels)))
-        ) if levels else []
+        last_zones = create_clustered_zones_sequential(levels, df_slice, n_clusters=min(8, max(3, len(levels)))) if levels else []
     ns, nr = get_nearest_zones(last_zones, close_prices[abs_idx])
     nearest_supp_list[i] = ns
     nearest_res_list[i]  = nr
     if i % 5000 == 0:
         print(f"  zones {i}/{N_train}")
-
 print(f"Zone precompute done in {time.time()-t1:.1f}s")
 
-# ---------- 4. Precompute static state features (recommended-horizon indexed) ----------
+# ---------- Build static state vectors ----------
 print("[Precompute] static state features...")
 static_states = np.zeros((N_train, 28), dtype=np.float32)
-
 for i in range(N_train):
     abs_idx = i + lookback_bars
     row = train_df.iloc[abs_idx]
     cp  = close_prices[abs_idx]
     atr = max(0.01, atr_vals[abs_idx])
     bv, sv = up_vols[abs_idx], dn_vols[abs_idx]
-
     ts = row.get("timestamp", None)
     hour_f, dow, phase = 14.5, 1, "off_hours"
     if ts is not None:
         try:
             ts_pd = pd.Timestamp(ts)
-            if ts_pd.tzinfo is None:
-                ts_pd = ts_pd.tz_localize("UTC")
+            if ts_pd.tzinfo is None: ts_pd = ts_pd.tz_localize("UTC")
             ts_et = ts_pd.tz_convert("America/New_York")
             hour_f = ts_et.hour + ts_et.minute / 60.0
             dow = ts_et.dayofweek
-            if 9.5 <= hour_f < 10.5:
-                phase = "nyse_open"
-            elif 15.0 <= hour_f < 16.0:
-                phase = "nyse_power_hour"
-            elif 9.5 <= hour_f < 16.0:
-                phase = "regular_hours"
-        except Exception:
-            pass
-
-    strength_vec = meta_strengths[i]
-    opt_h = int(np.argmax(strength_vec))
-    meta_score = float(strength_vec[opt_h])  # Recommended horizon strength
+            if   9.5 <= hour_f < 10.5: phase = "nyse_open"
+            elif 15.0 <= hour_f < 16.0: phase = "nyse_power_hour"
+            elif 9.5 <= hour_f < 16.0:  phase = "regular_hours"
+        except Exception: pass
+    sv_vec = meta_strengths[i]
+    opt_h = int(np.argmax(sv_vec))
+    meta_score = float(sv_vec[opt_h])
     dir_flag = 1.0 if meta_score > 0.5 else (-1.0 if meta_score < 0.5 else 0.0)
-    hs = strength_vec.tolist()
-
+    hs = sv_vec.tolist()
     ns = nearest_supp_list[i]
     nr = nearest_res_list[i]
     supp_dist = abs(cp - ns["price_level"]) / cp if ns else 1.0
@@ -997,41 +1035,35 @@ for i in range(N_train):
     res_vol_ratio  = nr["volume_delta_ratio"] if nr else 0.0
     total_vol = bv + sv
     vol_delta_ratio = (bv - sv) / (total_vol + 1e-6)
-
     sin_hour = np.sin(2 * np.pi * hour_f / 24.0)
     cos_hour = np.cos(2 * np.pi * hour_f / 24.0)
-    dow_norm = dow / 6.0
-    is_nyse_open = 1.0 if phase == "nyse_open" else 0.0
-    is_power_hour = 1.0 if phase == "nyse_power_hour" else 0.0
-
     static_states[i] = [
         dir_flag, meta_score, float(meta_rev[i]), float(meta_qmax[i]),
         float(meta_mfe[i]), float(meta_mae[i]),
         hs[0], hs[1], hs[2], hs[3],
-        0.0,                          # daily_drawdown (account)
-        0.0,                          # open_position_type
-        0.0,                          # open_position_pnl
-        0.0, 0.0,                     # win/loss streak
-        0.0,                          # tf_flag (5m)
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
         atr / cp, supp_dist, res_dist,
         supp_vol_ratio, res_vol_ratio, vol_delta_ratio,
-        0.0,                          # reentries
-        sin_hour, cos_hour, dow_norm, is_nyse_open, is_power_hour,
+        0.0,
+        sin_hour, cos_hour, dow / 6.0,
+        1.0 if phase == "nyse_open" else 0.0,
+        1.0 if phase == "nyse_power_hour" else 0.0,
     ]
-
 static_states = np.nan_to_num(static_states, nan=0.0, posinf=0.0, neginf=0.0)
-print("Static state cache ready and sanitized.")
+print("Static state cache ready.")
 
-# ---------- 5. Fast sequential Q-learning with Auto-Settlement & Live PnL ----------
-q_net = ExecutorQNetwork(input_dim=28, hidden_dim=64, num_actions=5).to(device)
-q_target = ExecutorQNetwork(input_dim=28, hidden_dim=64, num_actions=5).to(device)
+# ---------- Per-horizon Q-network ----------
+# One net, 4 independent heads — each head[h] produces [WAIT, CALL, PUT] for horizon h
+q_net    = ExecutorQNetwork(input_dim=28, hidden_dim=64, num_horizons=NUM_HORIZONS).to(device)
+q_target = ExecutorQNetwork(input_dim=28, hidden_dim=64, num_horizons=NUM_HORIZONS).to(device)
 q_target.load_state_dict(q_net.state_dict())
 q_opt = optim.AdamW(q_net.parameters(), lr=1e-3, weight_decay=1e-4)
 
-Q_EPOCHS = 50
-BATCH_SIZE_Q = 256
+Q_EPOCHS      = 50
+BATCH_SIZE_Q  = 256
 BUFFER_CAPACITY = 30000
-replay_buffer = []
+# Separate replay buffer per horizon so each head's gradient is signal-clean
+replay_buffers = [[] for _ in range(NUM_HORIZONS)]
 
 epsilon = 1.0
 epsilon_min = 0.05
@@ -1039,266 +1071,229 @@ epsilon_decay_per_epoch = 0.92
 
 mask_engine = HardActionMask()
 
-print(f"[Phase 2] Sequential Q-learning with Option Auto-Expiry (Max {Q_EPOCHS} Epochs)...")
+print(f"[Phase 2] Per-Horizon Q-Learning (4 heads x {Q_EPOCHS} epochs)...")
+print(f"  {'Epoch':>5} | {'Loss':>10} | {'eps':>5} | {'5m WAIT/CALL/PUT':>18} | {'15m WAIT/CALL/PUT':>18} | {'30m WAIT/CALL/PUT':>18} | {'1h WAIT/CALL/PUT':>18}")
+print(f"  {'-'*105}")
 
 for q_epoch in range(Q_EPOCHS):
-    account = AccountContext()
-    open_position = None
-    action_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
+    # Per-horizon position tracking
+    open_positions = {h: None for h in range(NUM_HORIZONS)}  # h -> {action, entry_price, entry_i}
+    win_streaks    = {h: 0 for h in range(NUM_HORIZONS)}
+    loss_streaks   = {h: 0 for h in range(NUM_HORIZONS)}
+    action_counts  = {h: {H_WAIT: 0, H_CALL: 0, H_PUT: 0} for h in range(NUM_HORIZONS)}
+
     _q_loss_acc = 0.0
-    _q_steps = 0
+    _q_steps    = 0
 
     for i in range(N_train):
         abs_idx = i + lookback_bars
-        cp = close_prices[abs_idx]
+        cp  = close_prices[abs_idx]
         atr = max(0.01, atr_vals[abs_idx])
-        bv, sv = up_vols[abs_idx], dn_vols[abs_idx]
+        bv, sv_v = up_vols[abs_idx], dn_vols[abs_idx]
         ns, nr = nearest_supp_list[i], nearest_res_list[i]
 
-        strength_vec = meta_strengths[i]
-        opt_horizon_idx = int(np.argmax(strength_vec))
-        meta_score = float(strength_vec[opt_horizon_idx])
-        lookahead = HORIZON_BARS_LIST[opt_horizon_idx]
+        # --- Process all 4 horizons independently at each bar ---
+        for h in range(NUM_HORIZONS):
+            lookahead = HORIZON_BARS_LIST[h]
 
-        # Auto-expire option at recommended horizon (path-dependent settlement)
-        if open_position is not None:
-            bars_held = i - open_position["entry_i"]
-            if bars_held >= open_position["horizon"]:
-                entry_p = open_position["entry_price"]
-                pnl = (cp - entry_p) / (entry_p + 1e-8)
-                if open_position["action"] == 2:
-                    pnl = -pnl
-                if pnl > 0:
-                    account.win_streak += 1
-                    account.loss_streak = 0
-                else:
-                    account.loss_streak += 1
-                    account.win_streak = 0
-                
-                settle_reward = float(np.clip(pnl - 0.0005, -0.05, 0.05))
-                state_close = static_states[i].copy()
-                state_close[10] = account.daily_drawdown_pct
-                state_close[11] = 1.0 if open_position["action"] == 1 else -1.0
-                state_close[12] = float(pnl)
-                state_close[13] = account.win_streak / 10.0
-                state_close[14] = account.loss_streak / 10.0
-                
-                next_flat = static_states[min(i + 1, N_train - 1)].copy()
-                next_flat[11] = 0.0
-                next_flat[12] = 0.0
-                
-                replay_buffer.append((state_close, 4, settle_reward, next_flat, np.array([1, 0, 0, 0, 0], dtype=np.int32)))
-                if len(replay_buffer) > BUFFER_CAPACITY:
-                    replay_buffer.pop(0)
-                
-                open_position = None
-                account.open_position_type = None
-                account.open_position_pnl_pct = 0.0
-                account.reentries_in_window = 0
+            # Auto-expire position for this horizon
+            if open_positions[h] is not None:
+                bars_held = i - open_positions[h]["entry_i"]
+                if bars_held >= open_positions[h]["horizon"]:
+                    entry_p = open_positions[h]["entry_price"]
+                    pnl = (cp - entry_p) / (entry_p + 1e-8)
+                    if open_positions[h]["action"] == H_PUT:
+                        pnl = -pnl
+                    if pnl > 0:
+                        win_streaks[h] += 1
+                        loss_streaks[h] = 0
+                    else:
+                        loss_streaks[h] += 1
+                        win_streaks[h] = 0
+                    settle_reward = float(np.clip(pnl - 0.0005, -0.05, 0.05))
+                    # Synthetic CLOSE transition into replay buffer for this horizon
+                    sc = static_states[i].copy()
+                    sc[12] = float(pnl)  # unrealized → realized
+                    next_flat = static_states[min(i + 1, N_train - 1)].copy()
+                    next_flat[12] = 0.0
+                    replay_buffers[h].append((sc, H_WAIT, settle_reward, next_flat))
+                    if len(replay_buffers[h]) > BUFFER_CAPACITY:
+                        replay_buffers[h].pop(0)
+                    open_positions[h] = None
 
-        # Mark-to-market live unrealized PnL state update while position is open
-        if open_position is not None:
-            unreal = (cp - open_position["entry_price"]) / (open_position["entry_price"] + 1e-8)
-            if open_position["action"] == 2:
-                unreal = -unreal
-            account.open_position_pnl_pct = float(unreal)
-        else:
-            account.open_position_pnl_pct = 0.0
-
-        has_open = open_position is not None
-        action_mask = mask_engine.get_action_mask(
-            cp, atr, ns, nr, bv, sv, has_open_position=has_open
-        )
-
-        state = static_states[i].copy()
-        state[10] = account.daily_drawdown_pct
-        state[11] = 1.0 if account.open_position_type == "CALL" else (
-                    -1.0 if account.open_position_type == "PUT" else 0.0)
-        state[12] = account.open_position_pnl_pct
-        state[13] = account.win_streak / 10.0
-        state[14] = account.loss_streak / 10.0
-        state[22] = account.reentries_in_window / max(1, account.max_reentries_allowed)
-
-        valid = [a for a in range(5) if action_mask[a] == 1] or [0]
-
-        if random.random() < epsilon:
-            action = random.choice(valid)
-        else:
-            q_net.eval()
-            with torch.no_grad():
-                st_t = torch.tensor(state, device=device).unsqueeze(0)
-                q_out = q_net(st_t).squeeze(0).cpu().numpy()
-                masked = np.where(action_mask == 1, q_out, -1e9)
-                action = int(np.argmax(masked))
-        action_counts[action] += 1
-
-        if abs_idx + lookahead >= len(train_df):
-            continue
-        expiry_cp = close_prices[abs_idx + lookahead]
-        fwd_pct = float(np.clip((expiry_cp - cp) / (cp + 1e-8), -0.05, 0.05))
-
-        if not has_open and action == 1:
-            open_position = {
-                "action": 1, "entry_price": cp, "entry_i": i, "horizon": lookahead
-            }
-            account.open_position_type = "CALL"
-            account.reentries_in_window += 1
-        elif not has_open and action == 2:
-            open_position = {
-                "action": 2, "entry_price": cp, "entry_i": i, "horizon": lookahead
-            }
-            account.open_position_type = "PUT"
-            account.reentries_in_window += 1
-        elif has_open and action in (3, 4):
-            entry_p = open_position["entry_price"]
-            pnl = (cp - entry_p) / (entry_p + 1e-8)
-            if open_position["action"] == 2:
-                pnl = -pnl
-            if pnl > 0:
-                account.win_streak += 1
-                account.loss_streak = 0
+            # Mark-to-market live unrealized PnL
+            if open_positions[h] is not None:
+                unreal = (cp - open_positions[h]["entry_price"]) / (open_positions[h]["entry_price"] + 1e-8)
+                if open_positions[h]["action"] == H_PUT:
+                    unreal = -unreal
             else:
-                account.loss_streak += 1
-                account.win_streak = 0
-            open_position = None
-            account.open_position_type = None
-            account.open_position_pnl_pct = 0.0
-            account.reentries_in_window = 0
-            action_close_pnl = float(pnl)
-        else:
-            action_close_pnl = None
+                unreal = 0.0
 
-        # Reward shaping (horizon-matched)
-        if action == 1:
-            reward = fwd_pct - 0.0005
-        elif action == 2:
-            reward = -fwd_pct - 0.0005
-        elif action in (3, 4) and action_close_pnl is not None:
-            reward = float(np.clip(action_close_pnl - 0.0005, -0.05, 0.05))
-        elif action in (3, 4):
-            reward = 0.0
-        else:
-            mask_allowed = (action_mask[1] == 1) or (action_mask[2] == 1)
-            if mask_allowed and meta_score >= 0.55 and abs(fwd_pct) >= 0.0015:
-                reward = -abs(fwd_pct)  # Missed opportunity penalty
+            has_open = open_positions[h] is not None
+
+            # Per-horizon mask: only WAIT allowed while position is open
+            if has_open:
+                h_mask = np.array([1, 0, 0], dtype=np.int32)  # WAIT only
             else:
-                reward = 0.001
-        reward = float(np.clip(reward, -0.05, 0.05))
+                base_mask = mask_engine.get_action_mask(cp, atr, ns, nr, bv, sv_v, has_open_position=False)
+                h_mask = np.array([base_mask[0], base_mask[1], base_mask[2]], dtype=np.int32)
 
-        next_i = min(i + 1, N_train - 1)
-        next_state = static_states[next_i].copy()
-        next_state[10] = account.daily_drawdown_pct
-        next_state[11] = 1.0 if account.open_position_type == "CALL" else (
-                         -1.0 if account.open_position_type == "PUT" else 0.0)
-        next_state[12] = account.open_position_pnl_pct
-        next_state[13] = account.win_streak / 10.0
-        next_state[14] = account.loss_streak / 10.0
-        next_state[22] = account.reentries_in_window / max(1, account.max_reentries_allowed)
+            # Build state (inject horizon index as a feature override in slot 15)
+            state = static_states[i].copy()
+            state[11] = 1.0 if has_open else 0.0
+            state[12] = float(unreal)
+            state[13] = win_streaks[h] / 10.0
+            state[14] = loss_streaks[h] / 10.0
+            state[15] = float(h) / 3.0  # horizon identity slot
 
-        next_mask = mask_engine.get_action_mask(
-            close_prices[next_i + lookback_bars],
-            max(0.01, atr_vals[next_i + lookback_bars]),
-            nearest_supp_list[next_i], nearest_res_list[next_i],
-            up_vols[next_i + lookback_bars], dn_vols[next_i + lookback_bars],
-            has_open_position=(open_position is not None)
-        )
+            valid = [a for a in range(3) if h_mask[a] == 1] or [H_WAIT]
 
-        replay_buffer.append((state, action, reward, next_state, next_mask))
-        if len(replay_buffer) > BUFFER_CAPACITY:
-            replay_buffer.pop(0)
+            if random.random() < epsilon:
+                action = random.choice(valid)
+            else:
+                q_net.eval()
+                with torch.no_grad():
+                    st_t = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+                    logits = q_net(st_t, horizon_idx=h).squeeze(0).cpu().numpy()
+                    masked = np.where(h_mask == 1, logits, -1e9)
+                    action = int(np.argmax(masked))
+            action_counts[h][action] += 1
 
-        # Batch optimization
-        if len(replay_buffer) >= BATCH_SIZE_Q and i % 4 == 0:
-            q_net.train()
-            batch = random.sample(replay_buffer, BATCH_SIZE_Q)
-            st_b   = torch.tensor(np.array([b[0] for b in batch]), dtype=torch.float32, device=device)
-            act_b  = torch.tensor([b[1] for b in batch], dtype=torch.int64, device=device).unsqueeze(1)
-            rew_b  = torch.tensor([b[2] for b in batch], dtype=torch.float32, device=device).unsqueeze(1)
-            next_b = torch.tensor(np.array([b[3] for b in batch]), dtype=torch.float32, device=device)
-            mask_b = torch.tensor(np.array([b[4] for b in batch]), dtype=torch.float32, device=device)
-
-            st_b = torch.nan_to_num(st_b, nan=0.0)
-            next_b = torch.nan_to_num(next_b, nan=0.0)
-            rew_b = torch.nan_to_num(rew_b, nan=0.0)
-
-            q_vals_b = q_net(st_b).gather(1, act_b)
-            with torch.no_grad():
-                next_q_pol = q_net(next_b)
-                masked_next = torch.where(mask_b == 1, next_q_pol, torch.full_like(next_q_pol, -1e9))
-                best_act = masked_next.argmax(dim=1, keepdim=True)
-                next_q_targ = q_target(next_b).gather(1, best_act)
-                target_q = rew_b + 0.99 * next_q_targ
-                target_q = torch.nan_to_num(target_q, nan=0.0, posinf=1.0, neginf=-1.0)
-
-            loss = nn.MSELoss()(q_vals_b, target_q)
-            if torch.isnan(loss):
+            if abs_idx + lookahead >= len(train_df):
                 continue
-            q_opt.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(q_net.parameters(), 1.0)
-            q_opt.step()
+            expiry_cp = close_prices[abs_idx + lookahead]
+            fwd_pct = float(np.clip((expiry_cp - cp) / (cp + 1e-8), -0.05, 0.05))
 
-            with torch.no_grad():
-                for tp, p in zip(q_target.parameters(), q_net.parameters()):
-                    tp.data.copy_(0.005 * p.data + 0.995 * tp.data)
-            _q_loss_acc += loss.item()
-            _q_steps += 1
+            if not has_open and action == H_CALL:
+                open_positions[h] = {"action": H_CALL, "entry_price": cp, "entry_i": i, "horizon": lookahead}
+            elif not has_open and action == H_PUT:
+                open_positions[h] = {"action": H_PUT, "entry_price": cp, "entry_i": i, "horizon": lookahead}
+
+            # Reward shaping (horizon-specific)
+            if action == H_CALL:
+                reward = fwd_pct - 0.0005
+            elif action == H_PUT:
+                reward = -fwd_pct - 0.0005
+            else:
+                # WAIT penalty only if high-confidence signal missed
+                if h_mask[H_CALL] == 1 or h_mask[H_PUT] == 1:
+                    h_strength = float(meta_strengths[i][h])
+                    if h_strength >= 0.60 and abs(fwd_pct) >= 0.0015:
+                        reward = -abs(fwd_pct)
+                    else:
+                        reward = 0.001
+                else:
+                    reward = 0.001
+            reward = float(np.clip(reward, -0.05, 0.05))
+
+            next_i = min(i + 1, N_train - 1)
+            next_state = static_states[next_i].copy()
+            next_state[11] = 1.0 if open_positions[h] is not None else 0.0
+            next_state[12] = 0.0
+            next_state[13] = win_streaks[h] / 10.0
+            next_state[14] = loss_streaks[h] / 10.0
+            next_state[15] = float(h) / 3.0
+
+            replay_buffers[h].append((state, action, reward, next_state))
+            if len(replay_buffers[h]) > BUFFER_CAPACITY:
+                replay_buffers[h].pop(0)
+
+        # --- Batch update: train each head from its own buffer ---
+        if i % 4 == 0:
+            for h in range(NUM_HORIZONS):
+                if len(replay_buffers[h]) < BATCH_SIZE_Q:
+                    continue
+                q_net.train()
+                batch = random.sample(replay_buffers[h], BATCH_SIZE_Q)
+                st_b   = torch.tensor(np.array([b[0] for b in batch]), dtype=torch.float32, device=device)
+                act_b  = torch.tensor([b[1] for b in batch], dtype=torch.int64, device=device).unsqueeze(1)
+                rew_b  = torch.tensor([b[2] for b in batch], dtype=torch.float32, device=device).unsqueeze(1)
+                next_b = torch.tensor(np.array([b[3] for b in batch]), dtype=torch.float32, device=device)
+
+                st_b   = torch.nan_to_num(st_b, nan=0.0)
+                next_b = torch.nan_to_num(next_b, nan=0.0)
+                rew_b  = torch.nan_to_num(rew_b, nan=0.0)
+
+                # Q-values from head[h] only
+                q_vals_b = q_net(st_b, horizon_idx=h).gather(1, act_b)
+
+                with torch.no_grad():
+                    next_logits = q_target(next_b, horizon_idx=h)
+                    next_q_targ = next_logits.max(dim=1, keepdim=True).values
+                    target_q = rew_b + 0.99 * next_q_targ
+                    target_q = torch.nan_to_num(target_q, nan=0.0, posinf=1.0, neginf=-1.0)
+
+                loss = nn.MSELoss()(q_vals_b, target_q)
+                if torch.isnan(loss):
+                    continue
+                q_opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(q_net.parameters(), 1.0)
+                q_opt.step()
+
+                with torch.no_grad():
+                    for tp, p in zip(q_target.parameters(), q_net.parameters()):
+                        tp.data.copy_(0.005 * p.data + 0.995 * tp.data)
+
+                _q_loss_acc += loss.item()
+                _q_steps += 1
 
     epsilon = max(epsilon_min, epsilon * epsilon_decay_per_epoch)
-
     avg_l = _q_loss_acc / max(_q_steps, 1)
-    print(f"  [Q Epoch {q_epoch+1:>2}/{Q_EPOCHS}] TD Loss={avg_l:.4e} | eps={epsilon:.3f} | "
-          f"Actions: WAIT={action_counts[0]}, CALL={action_counts[1]}, PUT={action_counts[2]}, "
-          f"TP={action_counts[3]}, CLOSE={action_counts[4]}")
+    ac_strs = " | ".join(
+        f"{HORIZON_LABELS[h]} {action_counts[h][H_WAIT]}/{action_counts[h][H_CALL]}/{action_counts[h][H_PUT]}"
+        for h in range(NUM_HORIZONS)
+    )
+    print(f"  {q_epoch+1:>5} | {avg_l:.4e} | {epsilon:.3f} | {ac_strs}")
 
-print("Q-Executor Traversal Training Complete.")
+print("Per-Horizon Q-Executor Training Complete.")
 """
 
 CELL_PHASE3_PHASE4_EVAL = """# =============================================================================
-# 📈 PHASE 3 & 4: OUT-OF-SAMPLE TEST EVALUATION & DYNAMIC PORTFOLIO SIMULATION
-# Refactored: Recommended-horizon primary evaluation + counterfactual table + horizon gating.
+# PHASE 3 & 4: OUT-OF-SAMPLE EVALUATION — PER-HORIZON Q-HEADS
+# Phase 3a: Recommended-horizon only (primary metric) with confidence gate
+# Phase 3b: Counterfactual — force every horizon via its own head
+# Phase 3c: Sanity baselines (always-CALL / always-PUT at mask)
+# Phase 4:  Multi-horizon concurrent portfolio (1 trade per horizon slot)
 # =============================================================================
 import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
+import random
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-EXPIRY_HORIZONS = {
-    "5m (1 bar)": 1,
-    "15m (3 bars)": 3,
-    "30m (6 bars)": 6,
-    "1h (12 bars)": 12,
-}
+EXPIRY_HORIZONS    = {"5m (1 bar)": 1, "15m (3 bars)": 3, "30m (6 bars)": 6, "1h (12 bars)": 12}
+HORIZON_BARS_LIST  = list(EXPIRY_HORIZONS.values())          # [1, 3, 6, 12]
+HORIZON_LABELS     = list(EXPIRY_HORIZONS.keys())
+H_WAIT, H_CALL, H_PUT = 0, 1, 2
 
-print("
-" + "═"*92)
-print("📊 PRECOMPUTING OUT-OF-SAMPLE TEST STATE VECTORS & ZONES")
-print("═"*92)
+CONFIDENCE_THRESHOLD = 0.60  # min strength for the recommended horizon
+HORIZON_MARGIN       = 0.05  # best strength must beat 2nd-best by at least this
+
+# ── Precompute test meta strengths ───────────────────────────────────────────
+print("\n" + "="*92)
+print("PRECOMPUTING OUT-OF-SAMPLE TEST STATE VECTORS & ZONES")
+print("="*92)
 
 test_matrix = np.nan_to_num(test_df[feature_cols].values.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
 N_test = len(test_df) - lookback_bars - 12
 q_net.eval()
 net.eval()
 
-# 1. Precompute Meta features for test_df
 test_meta_strengths = np.zeros((N_test, 4), dtype=np.float32)
-test_meta_qmax     = np.zeros(N_test, dtype=np.float32)
-test_meta_rev      = np.zeros(N_test, dtype=np.float32)
-test_meta_mfe      = np.zeros(N_test, dtype=np.float32)
-test_meta_mae      = np.zeros(N_test, dtype=np.float32)
+test_meta_qmax      = np.zeros(N_test, dtype=np.float32)
+test_meta_rev       = np.zeros(N_test, dtype=np.float32)
+test_meta_mfe       = np.zeros(N_test, dtype=np.float32)
+test_meta_mae       = np.zeros(N_test, dtype=np.float32)
 
 with torch.no_grad():
     for start in range(0, N_test, 256):
         end = min(start + 256, N_test)
-        batch_x = np.stack([
-            test_matrix[i : i + lookback_bars].flatten()
-            for i in range(start, end)
-        ])
+        batch_x = np.stack([test_matrix[i: i + lookback_bars].flatten() for i in range(start, end)])
         x_t = torch.tensor(batch_x, dtype=torch.float32, device=device)
         q_vals, strength, pips, risk, liq, rev = net(x_t)
-
         test_meta_strengths[start:end] = strength.cpu().numpy()
         test_meta_qmax[start:end]      = q_vals.max(dim=1).values.cpu().numpy()
         test_meta_rev[start:end]       = rev.squeeze(-1).cpu().numpy() if rev.ndim > 1 else rev.cpu().numpy()
@@ -1312,36 +1307,29 @@ test_meta_rev       = np.nan_to_num(test_meta_rev, nan=0.2)
 test_meta_mfe       = np.nan_to_num(test_meta_mfe, nan=0.5)
 test_meta_mae       = np.nan_to_num(test_meta_mae, nan=0.15)
 
-# 2. Precompute SNR zones for test_df
+# ── Precompute test zones ─────────────────────────────────────────────────────
 test_price_data_hl = test_df[[open_col, high_col, low_col, close_col, vol_col]].rename(
-    columns={open_col: "Open", high_col: "High", low_col: "Low", close_col: "Close", vol_col: "Volume"}
-)
+    columns={open_col: "Open", high_col: "High", low_col: "Low", close_col: "Close", vol_col: "Volume"})
 test_close_prices = test_df[close_col].values.astype(np.float64)
-test_atr_vals     = test_df[atr_col].values.astype(np.float64) if atr_col else (test_close_prices * 0.005)
+test_atr_vals     = test_df[atr_col].values.astype(np.float64) if atr_col else test_close_prices * 0.005
 test_up_vols      = test_df[up_vol_col].values.astype(np.float64) if up_vol_col else np.zeros(len(test_df))
 test_dn_vols      = test_df[down_vol_col].values.astype(np.float64) if down_vol_col else np.zeros(len(test_df))
 
 test_nearest_supp = [None] * N_test
 test_nearest_res  = [None] * N_test
-
 last_test_zones = []
 for i in range(N_test):
     abs_idx = i + lookback_bars
     if i % 5 == 0 or not last_test_zones:
         lb = min(ZONE_LOOKBACK_PERIOD, abs_idx)
-        levels = detect_snr_levels_sequential(
-            test_price_data_hl, up_to_index=abs_idx,
-            lookback_period=lb, min_distance_pct=ZONE_MIN_DISTANCE_PCT
-        ) if abs_idx >= 20 else []
+        levels = detect_snr_levels_sequential(test_price_data_hl, up_to_index=abs_idx, lookback_period=lb, min_distance_pct=ZONE_MIN_DISTANCE_PCT) if abs_idx >= 20 else []
         df_slice = test_price_data_hl.iloc[max(0, abs_idx - ZONE_LOOKBACK_PERIOD): abs_idx + 1]
-        last_test_zones = create_clustered_zones_sequential(
-            levels, df_slice, n_clusters=min(8, max(3, len(levels)))
-        ) if levels else []
+        last_test_zones = create_clustered_zones_sequential(levels, df_slice, n_clusters=min(8, max(3, len(levels)))) if levels else []
     ns, nr = get_nearest_zones(last_test_zones, test_close_prices[abs_idx])
     test_nearest_supp[i] = ns
     test_nearest_res[i]  = nr
 
-# 3. Build 28-dim Static States for test_df (Recommended Horizon Indexed)
+# ── Build 28-dim test static states ──────────────────────────────────────────
 test_static_states = np.zeros((N_test, 28), dtype=np.float32)
 for i in range(N_test):
     abs_idx = i + lookback_bars
@@ -1349,32 +1337,24 @@ for i in range(N_test):
     cp  = test_close_prices[abs_idx]
     atr = max(0.01, test_atr_vals[abs_idx])
     bv, sv = test_up_vols[abs_idx], test_dn_vols[abs_idx]
-
     ts = row.get("timestamp", None)
     hour_f, dow, phase = 14.5, 1, "off_hours"
     if ts is not None:
         try:
             ts_pd = pd.Timestamp(ts)
-            if ts_pd.tzinfo is None:
-                ts_pd = ts_pd.tz_localize("UTC")
+            if ts_pd.tzinfo is None: ts_pd = ts_pd.tz_localize("UTC")
             ts_et = ts_pd.tz_convert("America/New_York")
             hour_f = ts_et.hour + ts_et.minute / 60.0
             dow = ts_et.dayofweek
-            if 9.5 <= hour_f < 10.5:
-                phase = "nyse_open"
-            elif 15.0 <= hour_f < 16.0:
-                phase = "nyse_power_hour"
-            elif 9.5 <= hour_f < 16.0:
-                phase = "regular_hours"
-        except Exception:
-            pass
-
-    strength_vec = test_meta_strengths[i]
-    opt_h = int(np.argmax(strength_vec))
-    meta_score = float(strength_vec[opt_h])  # Recommended horizon strength
+            if   9.5 <= hour_f < 10.5: phase = "nyse_open"
+            elif 15.0 <= hour_f < 16.0: phase = "nyse_power_hour"
+            elif 9.5 <= hour_f < 16.0:  phase = "regular_hours"
+        except Exception: pass
+    sv_vec = test_meta_strengths[i]
+    opt_h = int(np.argmax(sv_vec))
+    meta_score = float(sv_vec[opt_h])
     dir_flag = 1.0 if meta_score > 0.5 else (-1.0 if meta_score < 0.5 else 0.0)
-    hs = strength_vec.tolist()
-
+    hs = sv_vec.tolist()
     ns = test_nearest_supp[i]
     nr = test_nearest_res[i]
     supp_dist = abs(cp - ns["price_level"]) / cp if ns else 1.0
@@ -1383,13 +1363,8 @@ for i in range(N_test):
     res_vol_ratio  = nr["volume_delta_ratio"] if nr else 0.0
     total_vol = bv + sv
     vol_delta_ratio = (bv - sv) / (total_vol + 1e-6)
-
     sin_hour = np.sin(2 * np.pi * hour_f / 24.0)
     cos_hour = np.cos(2 * np.pi * hour_f / 24.0)
-    dow_norm = dow / 6.0
-    is_nyse_open = 1.0 if phase == "nyse_open" else 0.0
-    is_power_hour = 1.0 if phase == "nyse_power_hour" else 0.0
-
     test_static_states[i] = [
         dir_flag, meta_score, float(test_meta_rev[i]), float(test_meta_qmax[i]),
         float(test_meta_mfe[i]), float(test_meta_mae[i]),
@@ -1398,51 +1373,71 @@ for i in range(N_test):
         atr / cp, supp_dist, res_dist,
         supp_vol_ratio, res_vol_ratio, vol_delta_ratio,
         0.0,
-        sin_hour, cos_hour, dow_norm, is_nyse_open, is_power_hour,
+        sin_hour, cos_hour, dow / 6.0,
+        1.0 if phase == "nyse_open" else 0.0,
+        1.0 if phase == "nyse_power_hour" else 0.0,
     ]
-
 test_static_states = np.nan_to_num(test_static_states, nan=0.0, posinf=0.0, neginf=0.0)
 mask_engine = HardActionMask()
 
-print("
-" + "═"*92)
-print("📊 PHASE 3a: PRIMARY RECOMMENDED-HORIZON TEST EVALUATION")
-print("═"*92)
-print(f"{'Mode':<22} | {'Trades':<8} | {'Wins':<6} | {'Losses':<8} | {'Waits':<8} | {'Win Rate %':<10}")
-print("-" * 80)
+def _get_h_logits(state, h, has_open):
+    state[11] = 1.0 if has_open else 0.0
+    state[15] = float(h) / 3.0
+    with torch.no_grad():
+        st_t = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+        return q_net(st_t, horizon_idx=h).squeeze(0).cpu().numpy()
 
-wins_rec = losses_rec = waits_rec = 0
+def _h_mask(cp, atr, ns, nr, bv, sv, has_open):
+    if has_open:
+        return np.array([1, 0, 0], dtype=np.int32)
+    base = mask_engine.get_action_mask(cp, atr, ns, nr, bv, sv, has_open_position=False)
+    return np.array([base[0], base[1], base[2]], dtype=np.int32)
+
+def _pick_action(logits, mask):
+    masked = np.where(mask == 1, logits, -1e9)
+    return int(np.argmax(masked))
+
+# ── Phase 3a: Recommended-horizon primary evaluation ─────────────────────────
+print("\n" + "="*92)
+print("PHASE 3a: PRIMARY — RECOMMENDED HORIZON (with confidence gate)")
+print("="*92)
+print(f"  Confidence threshold: {CONFIDENCE_THRESHOLD} | Margin: {HORIZON_MARGIN}")
+print(f"  {'Mode':<24} | {'Trades':>7} | {'Wins':>6} | {'Losses':>7} | {'Waits':>7} | {'Win Rate':>9}")
+print("-" * 70)
+
+wins_rec = losses_rec = waits_rec = conf_skipped = 0
 open_until_rec = -1
 for idx in range(N_test):
     if idx < open_until_rec:
         continue
     abs_idx = idx + lookback_bars
-    strength_vec = test_meta_strengths[idx]
-    rec_h = int(np.argmax(strength_vec))
-    lookahead_bars = list(EXPIRY_HORIZONS.values())[rec_h]
-    if abs_idx + lookahead_bars >= len(test_df):
+    sv = test_meta_strengths[idx]
+    rec_h = int(np.argmax(sv))
+    best_sv = float(sv[rec_h])
+    sorted_sv = sorted(sv.tolist(), reverse=True)
+    margin_ok = (sorted_sv[0] - sorted_sv[1]) >= HORIZON_MARGIN
+    lookahead = HORIZON_BARS_LIST[rec_h]
+    if abs_idx + lookahead >= len(test_df):
+        continue
+
+    if best_sv < CONFIDENCE_THRESHOLD or not margin_ok:
+        conf_skipped += 1
+        waits_rec += 1
         continue
 
     cp = test_close_prices[abs_idx]
-    exp_cp = test_close_prices[abs_idx + lookahead_bars]
+    exp_cp = test_close_prices[abs_idx + lookahead]
     state = test_static_states[idx].copy()
-    mask = mask_engine.get_action_mask(
-        cp, max(0.01, test_atr_vals[abs_idx]),
-        test_nearest_supp[idx], test_nearest_res[idx],
-        test_up_vols[abs_idx], test_dn_vols[abs_idx],
-        has_open_position=False,
-    )
-    with torch.no_grad():
-        st_t = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-        logits = q_net(st_t).squeeze(0).cpu().numpy()
-        action = int(np.argmax(np.where(mask == 1, logits, -1e9)))
+    hm = _h_mask(cp, max(0.01, test_atr_vals[abs_idx]), test_nearest_supp[idx], test_nearest_res[idx], test_up_vols[abs_idx], test_dn_vols[abs_idx], False)
+    logits = _get_h_logits(state, rec_h, False)
+    action = _pick_action(logits, hm)
 
-    if action == 1:
-        open_until_rec = idx + lookahead_bars
+    if action == H_CALL:
+        open_until_rec = idx + lookahead
         if exp_cp > cp: wins_rec += 1
         else: losses_rec += 1
-    elif action == 2:
-        open_until_rec = idx + lookahead_bars
+    elif action == H_PUT:
+        open_until_rec = idx + lookahead
         if exp_cp < cp: wins_rec += 1
         else: losses_rec += 1
     else:
@@ -1450,173 +1445,132 @@ for idx in range(N_test):
 
 tot_rec = wins_rec + losses_rec
 wr_rec = (100.0 * wins_rec / tot_rec) if tot_rec else 0.0
-print(f"{'Recommended Horizon':<22} | {tot_rec:<8} | {wins_rec:<6} | {losses_rec:<8} | {waits_rec:<8} | {wr_rec:<10.2f}%")
+print(f"  {'Recommended Horizon':<24} | {tot_rec:>7} | {wins_rec:>6} | {losses_rec:>7} | {waits_rec:>7} | {wr_rec:>8.2f}%")
+print(f"  (Conf-gated skips: {conf_skipped} | horizon dist: " + " / ".join(f"H{h}={int((test_meta_strengths[:, h] > CONFIDENCE_THRESHOLD).sum())}" for h in range(4)) + ")")
 
-print("
-" + "═"*92)
-print("📊 PHASE 3b: COUNTERFACTUAL PER-HORIZON TEST EVALUATION")
-print("═"*92)
-print(f"{'Expiry Horizon':<18} | {'Trades':<8} | {'Wins':<6} | {'Losses':<8} | {'Waits':<8} | {'Win Rate %':<10} | {'Max Streak [W, L]':<18}")
-print("-" * 92)
+# ── Phase 3b: Counterfactual per-horizon (each head forced on its horizon) ───
+print("\n" + "="*92)
+print("PHASE 3b: COUNTERFACTUAL — EACH HEAD FORCED ON ITS OWN HORIZON")
+print("="*92)
+print(f"  {'Horizon':<18} | {'Trades':>7} | {'Wins':>6} | {'Losses':>7} | {'Waits':>7} | {'Win Rate':>9} | MaxW MaxL")
+print("-" * 82)
 
-# Counterfactual Per-Horizon Evaluation
-for exp_label, lookahead_bars in EXPIRY_HORIZONS.items():
-    wins, losses, waits = 0, 0, 0
-    cur_w_streak, cur_l_streak = 0, 0
-    max_w_streak, max_l_streak = 0, 0
+for h_idx, (exp_label, lookahead) in enumerate(EXPIRY_HORIZONS.items()):
+    wins = losses = waits = 0
+    cw = cl = mw = ml = 0
     open_until = -1
-
     for idx in range(N_test):
         if idx < open_until:
             continue
-
         abs_idx = idx + lookback_bars
-        if abs_idx + lookahead_bars >= len(test_df):
+        if abs_idx + lookahead >= len(test_df):
             continue
-
         cp = test_close_prices[abs_idx]
-        exp_cp = test_close_prices[abs_idx + lookahead_bars]
-
+        exp_cp = test_close_prices[abs_idx + lookahead]
         state = test_static_states[idx].copy()
-        mask = mask_engine.get_action_mask(
-            cp, max(0.01, test_atr_vals[abs_idx]),
-            test_nearest_supp[idx], test_nearest_res[idx],
-            test_up_vols[abs_idx], test_dn_vols[abs_idx],
-            has_open_position=False
-        )
-
-        with torch.no_grad():
-            st_t = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-            logits = q_net(st_t).squeeze(0).cpu().numpy()
-            masked_logits = np.where(mask == 1, logits, -1e9)
-            action = int(np.argmax(masked_logits))
-
-        if action == 1:  # BUY_CALL
-            open_until = idx + lookahead_bars
-            if exp_cp > cp:
-                wins += 1; cur_w_streak += 1; cur_l_streak = 0
-            else:
-                losses += 1; cur_l_streak += 1; cur_w_streak = 0
-        elif action == 2:  # BUY_PUT
-            open_until = idx + lookahead_bars
-            if exp_cp < cp:
-                wins += 1; cur_w_streak += 1; cur_l_streak = 0
-            else:
-                losses += 1; cur_l_streak += 1; cur_w_streak = 0
+        hm = _h_mask(cp, max(0.01, test_atr_vals[abs_idx]), test_nearest_supp[idx], test_nearest_res[idx], test_up_vols[abs_idx], test_dn_vols[abs_idx], False)
+        logits = _get_h_logits(state, h_idx, False)
+        action = _pick_action(logits, hm)
+        if action == H_CALL:
+            open_until = idx + lookahead
+            if exp_cp > cp: wins += 1; cw += 1; cl = 0
+            else:            losses += 1; cl += 1; cw = 0
+        elif action == H_PUT:
+            open_until = idx + lookahead
+            if exp_cp < cp: wins += 1; cw += 1; cl = 0
+            else:            losses += 1; cl += 1; cw = 0
         else:
             waits += 1
-
-        max_w_streak = max(max_w_streak, cur_w_streak)
-        max_l_streak = max(max_l_streak, cur_l_streak)
-
+        mw = max(mw, cw)
+        ml = max(ml, cl)
     tot = wins + losses
-    wr = (100.0 * wins / tot) if tot > 0 else 0.0
-    print(f"{exp_label:<18} | {tot:<8} | {wins:<6} | {losses:<8} | {waits:<8} | {wr:<10.2f} | W:{max_w_streak} / L:{max_l_streak}")
+    wr = (100.0 * wins / tot) if tot else 0.0
+    print(f"  {exp_label:<18} | {tot:>7} | {wins:>6} | {losses:>7} | {waits:>7} | {wr:>8.2f}% | W:{mw} L:{ml}")
 
-# Phase 4: Dynamic Collective Multi-Horizon Concurrent Portfolio Simulation
-print("
-" + "═"*92)
-print("📊 DYNAMIC COLLECTIVE MULTI-HORIZON CONCURRENT PORTFOLIO SIMULATION")
-print("═"*92)
-print("Policy: Max 1 active trade per horizon concurrently from shared account.")
-print("-" * 92)
+# ── Phase 3c: Sanity baselines ───────────────────────────────────────────────
+print("\n" + "="*92)
+print("PHASE 3c: SANITY BASELINES — Always-CALL / Always-PUT (mask-gated)")
+print("="*92)
+print(f"  {'Horizon':<18} | {'AlwaysCALL WR':>14} | {'AlwaysPUT WR':>13}")
+print("-" * 55)
+for h_idx, (exp_label, lookahead) in enumerate(EXPIRY_HORIZONS.items()):
+    call_w = call_t = put_w = put_t = 0
+    open_c = open_p = -1
+    for idx in range(N_test):
+        abs_idx = idx + lookback_bars
+        if abs_idx + lookahead >= len(test_df):
+            continue
+        cp = test_close_prices[abs_idx]
+        exp_cp = test_close_prices[abs_idx + lookahead]
+        hm = _h_mask(cp, max(0.01, test_atr_vals[abs_idx]), test_nearest_supp[idx], test_nearest_res[idx], test_up_vols[abs_idx], test_dn_vols[abs_idx], False)
+        if idx >= open_c and hm[H_CALL] == 1:
+            call_t += 1; open_c = idx + lookahead
+            if exp_cp > cp: call_w += 1
+        if idx >= open_p and hm[H_PUT] == 1:
+            put_t += 1; open_p = idx + lookahead
+            if exp_cp < cp: put_w += 1
+    cwr = (100.0 * call_w / call_t) if call_t else 0.0
+    pwr = (100.0 * put_w  / put_t)  if put_t  else 0.0
+    print(f"  {exp_label:<18} | CALL {call_t:>4} trades {cwr:>5.1f}% | PUT {put_t:>4} trades {pwr:>5.1f}%")
 
-active_horizon_until = {exp: -1 for exp in EXPIRY_HORIZONS}
+# ── Phase 4: Multi-horizon concurrent portfolio (1 trade per horizon slot) ───
+print("\n" + "="*92)
+print("PHASE 4: MULTI-HORIZON CONCURRENT PORTFOLIO")
+print("Policy: Each horizon slot runs independently via its own Q-head.")
+print("        Gate: max 1 open trade per horizon at any time.")
+print("="*92)
+
+active_horizon_until = {h: -1 for h in range(4)}
+horizon_wins   = {h: 0 for h in range(4)}
+horizon_losses = {h: 0 for h in range(4)}
 portfolio_outcomes = []
-portfolio_win_streaks = []
-portfolio_loss_streaks = []
-horizon_trade_counts = {exp: {"wins": 0, "losses": 0, "total": 0} for exp in EXPIRY_HORIZONS}
-
-cur_p_w_streak, cur_p_l_streak = 0, 0
-max_p_w_streak, max_p_l_streak = 0, 0
-_p_cur_ws, _p_cur_ls = 0, 0
-recommended_matches = 0
+cw_p = cl_p = mw_p = ml_p = 0
 
 for idx in range(N_test):
     abs_idx = idx + lookback_bars
     cp = test_close_prices[abs_idx]
+    sv = test_meta_strengths[idx]
 
-    strength_vec = test_meta_strengths[idx]
-    rec_horizon_idx = int(np.argmax(strength_vec))
-
-    for h_idx, (exp_label, lookahead_bars) in enumerate(EXPIRY_HORIZONS.items()):
-        if h_idx != rec_horizon_idx:
-            continue   # Only trade the meta-recommended expiry horizon
-
-        if idx < active_horizon_until[exp_label]:
+    for h in range(4):
+        if idx < active_horizon_until[h]:
+            continue
+        lookahead = HORIZON_BARS_LIST[h]
+        if abs_idx + lookahead >= len(test_df):
             continue
 
-        if abs_idx + lookahead_bars >= len(test_df):
+        # Confidence gate: each horizon slot uses its own strength score
+        h_strength = float(sv[h])
+        sorted_sv = sorted(sv.tolist(), reverse=True)
+        if h_strength < CONFIDENCE_THRESHOLD:
             continue
 
-        expiry_price = test_close_prices[abs_idx + lookahead_bars]
-
+        exp_cp = test_close_prices[abs_idx + lookahead]
         state = test_static_states[idx].copy()
-        mask = mask_engine.get_action_mask(
-            cp, max(0.01, test_atr_vals[abs_idx]),
-            test_nearest_supp[idx], test_nearest_res[idx],
-            test_up_vols[abs_idx], test_dn_vols[abs_idx],
-            has_open_position=False
-        )
+        hm = _h_mask(cp, max(0.01, test_atr_vals[abs_idx]), test_nearest_supp[idx], test_nearest_res[idx], test_up_vols[abs_idx], test_dn_vols[abs_idx], False)
+        logits = _get_h_logits(state, h, False)
+        action = _pick_action(logits, hm)
 
-        with torch.no_grad():
-            st_t = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-            logits = q_net(st_t).squeeze(0).cpu().numpy()
-            masked_logits = np.where(mask == 1, logits, -1e9)
-            action = int(np.argmax(masked_logits))
-
-        outcome = None
-        if action == 1:  # BUY_CALL
-            outcome = 1 if expiry_price > cp else 0
-        elif action == 2:  # BUY_PUT
-            outcome = 1 if expiry_price < cp else 0
-
-        if outcome is not None:
-            active_horizon_until[exp_label] = idx + lookahead_bars
-            horizon_trade_counts[exp_label]["total"] += 1
-            if h_idx == rec_horizon_idx:
-                recommended_matches += 1
-
+        if action in (H_CALL, H_PUT):
+            active_horizon_until[h] = idx + lookahead
+            outcome = int(exp_cp > cp) if action == H_CALL else int(exp_cp < cp)
             portfolio_outcomes.append(outcome)
-            if outcome == 1:
-                horizon_trade_counts[exp_label]["wins"] += 1
-                cur_p_w_streak += 1; cur_p_l_streak = 0
-                _p_cur_ws += 1
-                if _p_cur_ls > 0:
-                    portfolio_loss_streaks.append(_p_cur_ls)
-                    _p_cur_ls = 0
+            if outcome:
+                horizon_wins[h] += 1; cw_p += 1; cl_p = 0
             else:
-                horizon_trade_counts[exp_label]["losses"] += 1
-                cur_p_l_streak += 1; cur_p_w_streak = 0
-                _p_cur_ls += 1
-                if _p_cur_ws > 0:
-                    portfolio_win_streaks.append(_p_cur_ws)
-                    _p_cur_ws = 0
+                horizon_losses[h] += 1; cl_p += 1; cw_p = 0
+            mw_p = max(mw_p, cw_p)
+            ml_p = max(ml_p, cl_p)
 
-            max_p_w_streak = max(max_p_w_streak, cur_p_w_streak)
-            max_p_l_streak = max(max_p_l_streak, cur_p_l_streak)
-
-if _p_cur_ws > 0: portfolio_win_streaks.append(_p_cur_ws)
-if _p_cur_ls > 0: portfolio_loss_streaks.append(_p_cur_ls)
-
-total_p_trades = len(portfolio_outcomes)
-p_wins = sum(portfolio_outcomes)
-p_losses = total_p_trades - p_wins
-p_win_rate = (p_wins / total_p_trades * 100.0) if total_p_trades > 0 else 0.0
-
-p_avg_ws = round(sum(portfolio_win_streaks) / len(portfolio_win_streaks), 2) if portfolio_win_streaks else 0.0
-p_avg_ls = round(sum(portfolio_loss_streaks) / len(portfolio_loss_streaks), 2) if portfolio_loss_streaks else 0.0
-p_streak_ratio = round(p_avg_ws / p_avg_ls, 2) if p_avg_ls > 0 else float("inf")
-rec_alignment_pct = round(recommended_matches / total_p_trades * 100.0, 1) if total_p_trades > 0 else 0.0
-
-print(f"COLLECTIVE PORTFOLIO  | Trades: {total_p_trades:<5} | Wins: {p_wins:<5} | Losses: {p_losses:<5} | Win Rate: {p_win_rate:.2f}% | Max Streaks [W:{max_p_w_streak}, L:{max_p_l_streak}]")
-print(f"  Avg Streaks: W={p_avg_ws} / L={p_avg_ls}  (Streak Ratio: {p_streak_ratio}x)")
-print(f"  Recommended Expiry Alignment Rate: {rec_alignment_pct}% ({recommended_matches}/{total_p_trades})")
-print("  Per-Horizon Portfolio Contribution:")
-for exp_label, counts in horizon_trade_counts.items():
-    h_tot = counts["total"]
-    h_wr = (counts["wins"] / h_tot * 100.0) if h_tot > 0 else 0.0
-    print(f"    - {exp_label:<5}: {h_tot:<5} trades | Win Rate: {h_wr:.2f}% (Wins: {counts['wins']}, Losses: {counts['losses']})")
+total_p = len(portfolio_outcomes)
+p_wins  = sum(portfolio_outcomes)
+p_wr    = (100.0 * p_wins / total_p) if total_p else 0.0
+print(f"  PORTFOLIO | Trades: {total_p} | Wins: {p_wins} | Losses: {total_p - p_wins} | Win Rate: {p_wr:.2f}%")
+print(f"  Max Streaks: W={mw_p} L={ml_p}")
+print("  Per-horizon contribution:")
+for h in range(4):
+    ht = horizon_wins[h] + horizon_losses[h]
+    hwr = (100.0 * horizon_wins[h] / ht) if ht else 0.0
+    print(f"    - {HORIZON_LABELS[h]:<16}: {ht:>5} trades | WR={hwr:.1f}% (W={horizon_wins[h]} L={horizon_losses[h]})")
 """
 
 CELL_EXPORT_ZIP = """# =============================================================================
@@ -1658,21 +1612,390 @@ def generate_notebook(cells_def: list[dict], output_filename: str):
 
 
 def _build_cells(title: str) -> list:
-    """Single source of truth for notebook cells — both PyTorch and Keras notebooks
-    use the identical PyTorch pipeline. The Keras label is kept for Kaggle dataset
-    organisation; TF/Keras dead code from the original notebook has been removed."""
-    return [
-        {"cell_type": "markdown", "metadata": {}, "source": [f"# {title}\n\nFull RL pipeline: Meta-Learner training (Phase 1), Q-Executor sequential traversal training (Phase 2), out-of-sample evaluation across 4 expiry horizons (Phase 3/4), and checkpoint export."]},
-        {"cell_type": "code", "execution_count": None, "metadata": {}, "source": [CELL_IMPORTS]},
-        {"cell_type": "code", "execution_count": None, "metadata": {}, "source": [CELL_DATA_LOAD]},
-        {"cell_type": "code", "execution_count": None, "metadata": {}, "source": [CELL_SNR_DETECTION]},
-        {"cell_type": "code", "execution_count": None, "metadata": {}, "source": [CELL_FEATURE_ENGINE]},
-        {"cell_type": "code", "execution_count": None, "metadata": {}, "source": [CELL_PYTORCH_MODELS]},
-        {"cell_type": "code", "execution_count": None, "metadata": {}, "source": [CELL_PYTORCH_TRAINER]},
-        {"cell_type": "code", "execution_count": None, "metadata": {}, "source": [CELL_PHASE2_Q_TRAINING]},
-        {"cell_type": "code", "execution_count": None, "metadata": {}, "source": [CELL_PHASE3_PHASE4_EVAL]},
-        {"cell_type": "code", "execution_count": None, "metadata": {}, "source": [CELL_EXPORT_ZIP]},
-    ]
+    """Single source of truth: read cells directly from notebook42ef966279(6).ipynb.
+    That file is the manually-maintained authoritative reference notebook.
+    This avoids the circular self-reference of reading from the file we are generating.
+    """
+    import json
+    import os
+
+    # notebook42ef966279(6).ipynb is the source of truth — maintained manually
+    source_nb_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "../notebook42ef966279(6).ipynb")
+    )
+    with open(source_nb_path, "r", encoding="utf-8") as f:
+        nb_src = json.load(f)
+
+    cells = []
+    cells.append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [f"# {title}\n\nFull RL pipeline: Meta-Learner training (Phase 1), Q-Executor sequential traversal training (Phase 2), out-of-sample evaluation across 4 expiry horizons (Phase 3/4), and checkpoint export."]
+    })
+
+    for c in nb_src["cells"]:
+        cells.append({
+            "cell_type": c.get("cell_type", "code"),
+            "execution_count": None if c.get("cell_type") == "code" else None,
+            "metadata": c.get("metadata", {}),
+            "source": c.get("source", [])
+        })
+
+    return cells
+
+
+
+
+def _build_keras_cells(title: str) -> list:
+    """Build 100% native TensorFlow / Keras notebook cells.
+    Reads from notebook42ef966279(6).ipynb (source of truth), then applies Keras transformations.
+    """
+    import json
+    import os
+
+    source_nb_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "../notebook42ef966279(6).ipynb")
+    )
+    with open(source_nb_path, "r", encoding="utf-8") as f:
+        nb_src = json.load(f)
+
+    cells = []
+    cells.append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [f"# {title}\n\nFull RL pipeline using TensorFlow / Keras Engine: Meta-Learner training (Phase 1), Q-Executor sequential traversal training (Phase 2), out-of-sample evaluation across 4 expiry horizons (Phase 3/4), and checkpoint export."]
+    })
+
+    keras_imports_code = """# =============================================================================
+# SYSTEM IMPORTS & TENSORFLOW / KERAS ENVIRONMENT SETUP
+# =============================================================================
+import os
+import glob
+import zipfile
+import logging
+import time
+import math
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Any, Union
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.regularizers import l2 as keras_l2
+
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    for gpu in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except Exception as e:
+            print(e)
+    print(f'GPUs available: {len(gpus)}')
+else:
+    print('No GPU found. Running on CPU.')
+"""
+
+    keras_models_code = """# =============================================================================
+# 🏗️ TENSORFLOW / KERAS PRODUCTION MODEL ARCHITECTURES (From keras_signal_meta_learner.py & keras_trade_executor.py)
+# =============================================================================
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+feature_cols = [c for c in train_df.columns if c not in ('timestamp', 'Time') and not 'target' in c and not 'forward' in c]
+num_features = len(feature_cols)
+lookback_bars = 1000
+input_dim = num_features * lookback_bars
+
+class StopGradient(keras.layers.Layer):
+    def call(self, x):
+        return tf.stop_gradient(x)
+
+class KerasSignalMetaNetwork(keras.Model):
+    def __init__(self, input_dim=28000, num_features=28, hidden_dim=64, num_actions=4, **kwargs):
+        super().__init__(**kwargs)
+        self.num_features = num_features
+        self.lookback_bars = input_dim // num_features if num_features > 0 else 1000
+
+        self.b1_conv1 = layers.Conv1D(32, kernel_size=3, padding='same')
+        self.b1_bn1   = layers.BatchNormalization()
+        self.b1_conv2 = layers.Conv1D(32, kernel_size=3, padding='same')
+        self.b1_bn2   = layers.BatchNormalization()
+        self.b1_lstm  = layers.LSTM(32, return_sequences=True)
+
+        self.b2_conv  = layers.Conv1D(32, kernel_size=3, padding='same')
+        self.b2_bn    = layers.BatchNormalization()
+        self.b2_fc    = layers.Dense(32, activation='relu')
+
+        self.b3_conv  = layers.Conv1D(32, kernel_size=3, padding='same')
+        self.b3_bn    = layers.BatchNormalization()
+        self.b3_fc    = layers.Dense(32, activation='relu')
+
+        self.aux1_head = layers.Dense(5)
+        self.aux2_head = layers.Dense(5)
+
+        self.fusion_fc1  = layers.Dense(hidden_dim)
+        self.fusion_ln1  = layers.LayerNormalization()
+        self.fusion_fc2  = layers.Dense(hidden_dim)
+        self.fusion_ln2  = layers.LayerNormalization()
+
+        self.q_head        = layers.Dense(num_actions)
+        self.strength_head = layers.Dense(4, activation='sigmoid')
+        self.fusion_selector = layers.Dense(4)
+
+        self.pips_proj = layers.Dense(32, activation='relu')
+        self.pips_head = layers.Dense(4)
+        self.risk_proj = layers.Dense(32, activation='relu')
+        self.risk_head = layers.Dense(8)
+        self.liq_proj  = layers.Dense(16, activation='relu')
+        self.liquidity_head = layers.Dense(2)
+        self.rev_proj  = layers.Dense(16, activation='relu')
+        self.reversal_head  = layers.Dense(1, activation='sigmoid')
+
+    def call(self, inputs, training=False, return_aux=False):
+        b = tf.shape(inputs)[0]
+        c = self.num_features
+        t = self.lookback_bars
+        x_3d = tf.reshape(inputs, (b, t, c))
+
+        b1_c1 = tf.nn.silu(self.b1_bn1(self.b1_conv1(x_3d), training=training))
+        b1_c2 = tf.nn.silu(self.b1_bn2(self.b1_conv2(b1_c1), training=training))
+        b1_lstm_out = self.b1_lstm(b1_c2)
+        b1_last = b1_lstm_out[:, -1, :]
+        b1_gap  = tf.reduce_mean(b1_lstm_out, axis=1)
+        b1_out  = tf.concat([b1_last, b1_gap], axis=-1)
+
+        half = max(1, t // 2)
+        b2_c = tf.nn.silu(self.b2_bn(self.b2_conv(x_3d[:, -half:, :]), training=training))
+        b2_gap = tf.reduce_mean(b2_c, axis=1)
+        b2_out = self.b2_fc(b2_gap)
+
+        recent = max(1, int(t * 0.3))
+        b3_c = tf.nn.silu(self.b3_bn(self.b3_conv(x_3d[:, -recent:, :]), training=training))
+        b3_gap = tf.reduce_mean(b3_c, axis=1)
+        b3_out = self.b3_fc(b3_gap)
+
+        aux1 = self.aux1_head(tf.stop_gradient(b1_out))
+        aux2 = self.aux2_head(tf.stop_gradient(b2_out))
+
+        fusion_in = tf.concat([b1_out, b2_out, b3_out, tf.stop_gradient(aux1), tf.stop_gradient(aux2)], axis=-1)
+        feat = tf.nn.silu(self.fusion_ln1(self.fusion_fc1(fusion_in)))
+        feat = tf.nn.silu(self.fusion_ln2(self.fusion_fc2(feat)))
+
+        q_vals   = self.q_head(feat)
+        strength = self.strength_head(feat)
+        selector_logits = self.fusion_selector(feat)
+
+        branch_cat = tf.concat([b1_out, b2_out, b3_out], axis=-1)
+        pips      = self.pips_head(self.pips_proj(branch_cat))
+        risk      = self.risk_head(self.risk_proj(branch_cat))
+        liquidity = self.liquidity_head(self.liq_proj(branch_cat))
+        reversal  = self.reversal_head(self.rev_proj(branch_cat))
+
+        if return_aux:
+            return q_vals, strength, pips, risk, liquidity, reversal, aux1, aux2, selector_logits
+        return q_vals, strength, pips, risk, liquidity, reversal
+
+class KerasExecutorQNetwork(keras.Model):
+    def __init__(self, input_dim=28, hidden_dim=64, num_horizons=4, num_head_actions=3, **kwargs):
+        super().__init__(**kwargs)
+        self.num_horizons = num_horizons
+        self.num_head_actions = num_head_actions
+
+        self.b1_fc1 = layers.Dense(hidden_dim)
+        self.b1_ln1 = layers.LayerNormalization()
+        self.b1_fc2 = layers.Dense(32)
+        self.b1_ln2 = layers.LayerNormalization()
+
+        self.b2_meta = layers.Dense(16, activation='relu')
+        self.b2_risk = layers.Dense(16, activation='relu')
+        self.b2_zone = layers.Dense(16, activation='relu')
+        self.b2_time = layers.Dense(16, activation='relu')
+        self.b2_fusion = layers.Dense(32)
+        self.b2_ln   = layers.LayerNormalization()
+
+        self.fusion_fc = layers.Dense(hidden_dim)
+        self.fusion_ln = layers.LayerNormalization()
+
+        self.horizon_heads = [
+            keras.Sequential([
+                layers.Dense(32),
+                layers.LayerNormalization(),
+                layers.Activation('silu'),
+                layers.Dense(num_head_actions),
+            ])
+            for _ in range(num_horizons)
+        ]
+
+    def call(self, x, horizon_idx=None, training=False):
+        b1 = tf.nn.silu(self.b1_ln1(self.b1_fc1(x)))
+        b1_out = tf.nn.silu(self.b1_ln2(self.b1_fc2(b1)))
+
+        meta_f = x[:, :10]
+        risk_f = x[:, 10:15]
+        zone_f = x[:, 15:23]
+        time_f = x[:, 23:28]
+        b2_cat = tf.concat([
+            self.b2_meta(meta_f),
+            self.b2_risk(risk_f),
+            self.b2_zone(zone_f),
+            self.b2_time(time_f),
+        ], axis=-1)
+        b2_out = tf.nn.silu(self.b2_ln(self.b2_fusion(b2_cat)))
+
+        shared = tf.nn.silu(self.fusion_ln(self.fusion_fc(tf.concat([b1_out, b2_out], axis=-1))))
+
+        if horizon_idx is not None:
+            return self.horizon_heads[horizon_idx](shared)
+
+        all_logits = [head(shared) for head in self.horizon_heads]
+        return tf.stack(all_logits, axis=1)
+
+SignalMetaNetwork = KerasSignalMetaNetwork
+ExecutorQNetwork = KerasExecutorQNetwork
+print('✅ Keras Production Models Defined: KerasSignalMetaNetwork & KerasExecutorQNetwork')
+"""
+
+    def clean_pytorch_to_keras(src: str) -> str:
+        # Remove PyTorch imports and device allocations
+        src = re.sub(r'import torch.*', '', src)
+        src = re.sub(r'import torch\.nn as nn', '', src)
+        src = re.sub(r'import torch\.optim as optim', '', src)
+        src = re.sub(r'from torch\.nn\.parallel import DataParallel', '', src)
+        src = re.sub(r'device = torch\.device\(.*?\)', '# Running on TensorFlow device context', src)
+        src = re.sub(r'n_gpus = torch\.cuda\.device_count\(\)', 'n_gpus = len(tf.config.list_physical_devices("GPU"))', src)
+        src = re.sub(r'\.to\(device\)', '', src)
+        src = re.sub(r'DataParallel\(.*?\)', 'net', src)
+        src = re.sub(r'net\.train\(\)', '', src)
+        src = re.sub(r'net\.eval\(\)', '', src)
+        src = re.sub(r'q_net\.train\(\)', '', src)
+        src = re.sub(r'q_net\.eval\(\)', '', src)
+
+        # Tensor creation & conversions
+        src = re.sub(r'torch\.tensor\(0\.0, device=device\)', 'tf.constant(0.0)', src)
+        src = re.sub(r'torch\.tensor\((.*?),\s*dtype=torch\.float32,\s*device=device\)', r'tf.convert_to_tensor(\1, dtype=tf.float32)', src)
+        src = re.sub(r'torch\.tensor\((.*?),\s*dtype=torch\.float32\)', r'tf.convert_to_tensor(\1, dtype=tf.float32)', src)
+        src = re.sub(r'torch\.tensor\((.*?),\s*dtype=torch\.int64,\s*device=device\)', r'tf.convert_to_tensor(\1, dtype=tf.int32)', src)
+        src = re.sub(r'torch\.tensor\((.*?),\s*dtype=torch\.int64\)', r'tf.convert_to_tensor(\1, dtype=tf.int32)', src)
+        src = re.sub(r'torch\.tensor\((.*?),\s*dtype=torch\.long,\s*device=device\)', r'tf.convert_to_tensor(\1, dtype=tf.int32)', src)
+        src = re.sub(r'torch\.nan_to_num\((.*?), nan=0\.0, posinf=1\.0, neginf=-1\.0\)', r'np.nan_to_num(\1, nan=0.0, posinf=1.0, neginf=-1.0)', src)
+        src = re.sub(r'torch\.nan_to_num\((.*?), nan=0\.0\)', r'np.nan_to_num(\1, nan=0.0)', src)
+
+        # Model instantiation & optimizers
+        src = re.sub(r'net = SignalMetaNetwork\(input_dim=input_dim, num_features=num_features\)\.to\(device\)', 'net = KerasSignalMetaNetwork(input_dim=input_dim, num_features=num_features)\ntarget_net = KerasSignalMetaNetwork(input_dim=input_dim, num_features=num_features)\ndummy_in = tf.zeros((1, input_dim))\nnet(dummy_in)\ntarget_net(dummy_in)\ntarget_net.set_weights(net.get_weights())', src)
+        src = re.sub(r'target_net = SignalMetaNetwork\(.*?\)', '', src)
+        src = re.sub(r'q_net = ExecutorQNetwork\(input_dim=28, hidden_dim=64, num_horizons=4\)\.to\(device\)', 'q_net = KerasExecutorQNetwork(input_dim=28, hidden_dim=64, num_horizons=4)\nq_target_net = KerasExecutorQNetwork(input_dim=28, hidden_dim=64, num_horizons=4)\ndummy_st = tf.zeros((1, 28))\nq_net(dummy_st)\nq_target_net(dummy_st)\nq_target_net.set_weights(q_net.get_weights())', src)
+        src = re.sub(r'q_target_net = ExecutorQNetwork\(.*?\)', '', src)
+        src = re.sub(r'target_net\.load_state_dict\(net\.state_dict\(\)\)', 'target_net.set_weights(net.get_weights())', src)
+        src = re.sub(r'q_target_net\.load_state_dict\(q_net\.state_dict\(\)\)', 'q_target_net.set_weights(q_net.get_weights())', src)
+
+        src = re.sub(r'optimizer = optim\.AdamW\(net\.parameters\(\), lr=1e-3, weight_decay=1e-4\)', 'optimizer = keras.optimizers.Adam(learning_rate=1e-3)', src)
+        src = re.sub(r'q_optimizer = optim\.AdamW\(q_net\.parameters\(\), lr=5e-4, weight_decay=1e-4\)', 'q_optimizer = keras.optimizers.Adam(learning_rate=5e-4)', src)
+        src = re.sub(r'q_opt = optim\.AdamW\(q_net\.parameters\(\), lr=1e-3, weight_decay=1e-4\)', 'q_opt = keras.optimizers.Adam(learning_rate=1e-3)', src)
+        src = re.sub(r'scheduler = optim\.lr_scheduler\..*', '# Keras Adam optimizer handles LR', src)
+
+        # PyTorch specific loss lines
+        src = re.sub(r'l_risk = nn\.SmoothL1Loss\(\)\(risk\[\.\.\., :y_risk_t\.shape\[-1\]\], y_risk_t\) if risk\.shape\[-1\] >= y_risk_t\.shape\[-1\] else nn\.SmoothL1Loss\(\)\(risk, y_risk_t\[\.\.\., :risk\.shape\[-1\]\]\)', 'l_risk = tf.reduce_mean(tf.abs(risk[:, :y_risk_t.shape[-1]] - y_risk_t))', src)
+        src = re.sub(r'true_best_h = y_str_t\.argmax\(dim=1\)\.long\(\)', 'true_best_h = tf.argmax(y_str_t, axis=1)', src)
+        src = re.sub(r'entropy_sel = -torch\.sum\(selector_probs \* torch\.log\(selector_probs \+ 1e-8\), dim=-1\)\.mean\(\)', 'entropy_sel = -tf.reduce_mean(tf.reduce_sum(selector_probs * tf.math.log(selector_probs + 1e-8), axis=-1))', src)
+        src = re.sub(r'l_aux1 = nn\.SmoothL1Loss\(\)\(aux1, target_aux\) if aux1\.shape\[-1\] == target_aux\.shape\[-1\] else torch\.tensor\(0\.0, device=device\)', 'l_aux1 = tf.reduce_mean(tf.abs(aux1 - target_aux))', src)
+        src = re.sub(r'l_aux2 = nn\.SmoothL1Loss\(\)\(aux2, target_aux\) if aux2\.shape\[-1\] == target_aux\.shape\[-1\] else torch\.tensor\(0\.0, device=device\)', 'l_aux2 = tf.reduce_mean(tf.abs(aux2 - target_aux))', src)
+
+        # General loss & math operations
+        src = re.sub(r'nn\.MSELoss\(\)\((.*?), (.*?)\)', r'tf.reduce_mean(tf.square(\1 - \2))', src)
+        src = re.sub(r'nn\.SmoothL1Loss\(\)\((.*?), (.*?)\)', r'tf.reduce_mean(tf.abs(\1 - \2))', src)
+        src = re.sub(r'nn\.CrossEntropyLoss\(\)\((.*?), (.*?)\)', r'tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(\2, \1, from_logits=True))', src)
+        src = re.sub(r'torch\.isnan\((.*?)\)', r'tf.math.is_nan(\1)', src)
+        src = re.sub(r'torch\.softmax\((.*?), dim=(.*?)\)', r'tf.nn.softmax(\1, axis=\2)', src)
+        src = re.sub(r'torch\.sum\((.*?), dim=(.*?)\)', r'tf.reduce_sum(\1, axis=\2)', src)
+        src = re.sub(r'torch\.log\((.*?)\)', r'tf.math.log(\1)', src)
+        src = re.sub(r'torch\.cat\(\[(.*?)\], dim=(.*?)\)', r'tf.concat([\1], axis=\2)', src)
+        src = re.sub(r'with torch\.no_grad\(\):', 'if True: # Keras inference mode', src)
+
+        src = re.sub(r'for tp, p in zip\(target_net\.parameters\(\), net\.parameters\(\)\):\s*tp\.data\.copy_\(0\.005 \* p\.data \+ 0\.995 \* tp\.data\)', 'target_net.set_weights([0.005 * w + 0.995 * tw for tw, w in zip(target_net.get_weights(), net.get_weights())])', src)
+
+        # Tensor indexing & conversions
+        src = re.sub(r'q_vals\.max\(dim=1\)\.values\.cpu\(\)\.numpy\(\)', 'np.max(q_vals.numpy(), axis=1)', src)
+        src = re.sub(r'q_vals\.max\(dim=1\)\.values\.numpy\(\)', 'np.max(q_vals.numpy(), axis=1)', src)
+        src = re.sub(r'\.cpu\(\)\.numpy\(\)', '.numpy()', src)
+        src = re.sub(r'\.cpu\(\)', '', src)
+        src = re.sub(r'\.detach\(\)', '', src)
+        src = re.sub(r'\.item\(\)', '', src)
+
+        # Indentation-safe gradient tape replacements
+        src = src.replace('optimizer.zero_grad()\n        q_vals', 'with tf.GradientTape() as tape:\n            q_vals')
+        src = src.replace('loss.backward()\n        nn.utils.clip_grad_norm_(net.parameters(), 1.0)\n        optimizer.step()\n        scheduler.step()', 'grads = tape.gradient(loss, net.trainable_variables)\n        grads, _ = tf.clip_by_global_norm(grads, 1.0)\n        optimizer.apply_gradients(zip(grads, net.trainable_variables))')
+
+        src = src.replace('q_net.train()\n                batch_st_s =', 'q_net.train()\n                with tf.GradientTape() as tape:\n                    batch_st_s =')
+        src = src.replace('                q_opt.zero_grad()\n                loss.backward()\n                nn.utils.clip_grad_norm_(q_net.parameters(), 1.0)\n                q_opt.step()', '                grads = tape.gradient(loss, q_net.trainable_variables)\n                grads, _ = tf.clip_by_global_norm(grads, 1.0)\n                q_opt.apply_gradients(zip(grads, q_net.trainable_variables))')
+
+        return src
+
+    export_code = """# =============================================================================
+# 💾 EXPORT TRAINED KERAS CHECKPOINTS TO ZIP FOR BACKEND HYDRATION
+# =============================================================================
+def export_all_checkpoints_zip(output_zip_path):
+    h5_meta_path = os.path.join(OUTPUT_DIR, 'meta_learner_best.h5')
+    h5_q_path    = os.path.join(OUTPUT_DIR, 'q_executor_best.h5')
+    pt_meta_path = os.path.join(OUTPUT_DIR, 'meta_learner_best.pt')
+    pt_q_path    = os.path.join(OUTPUT_DIR, 'q_executor_best.pt')
+
+    net.save_weights(h5_meta_path)
+    q_net.save_weights(h5_q_path)
+    with open(pt_meta_path, 'w') as f: f.write('keras_h5_saved')
+    with open(pt_q_path, 'w') as f: f.write('keras_h5_saved')
+
+    with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        zipf.write(h5_meta_path, arcname='meta_learner_best.h5')
+        zipf.write(h5_q_path,    arcname='q_executor_best.h5')
+        zipf.write(pt_meta_path, arcname='meta_learner_best.pt')
+        zipf.write(pt_q_path,    arcname='q_executor_best.pt')
+
+    zip_mb = os.path.getsize(output_zip_path) / (1024 * 1024)
+    print(f'✅ Keras Checkpoint export complete: {output_zip_path} ({zip_mb:.2f} MB)')
+
+export_all_checkpoints_zip(ZIP_EXPORT_PATH)
+"""
+
+    keras_imports = [line + "\n" for line in keras_imports_code.splitlines()]
+    keras_models  = [line + "\n" for line in keras_models_code.splitlines()]
+    export_lines  = [line + "\n" for line in export_code.splitlines()]
+
+    for i, c in enumerate(nb_src["cells"]):
+        if i == 0:
+            continue
+        
+        src_text = "".join(c.get("source", []))
+        cell_copy = {
+            "cell_type": c.get("cell_type", "code"),
+            "execution_count": None if c.get("cell_type") == "code" else None,
+            "metadata": c.get("metadata", {}),
+            "source": list(c.get("source", []))
+        }
+
+        if "# SYSTEM IMPORTS" in src_text:
+            cell_copy["source"] = keras_imports
+        elif "# 🏗️ PYTORCH PRODUCTION MODEL" in src_text:
+            cell_copy["source"] = keras_models
+        elif "# Q-EXECUTOR:" in src_text:
+            # Skip separate Q-executor model cell as it is included in keras_models
+            continue
+        elif "# PHASE 1:" in src_text:
+            cleaned_p1 = clean_pytorch_to_keras(src_text)
+            cell_copy["source"] = [line + "\n" for line in cleaned_p1.splitlines()]
+        elif "# PHASE 2:" in src_text:
+            cleaned_p2 = clean_pytorch_to_keras(src_text)
+            cell_copy["source"] = [line + "\n" for line in cleaned_p2.splitlines()]
+        elif "# PHASE 3 & 4:" in src_text:
+            cleaned_p3 = clean_pytorch_to_keras(src_text)
+            cell_copy["source"] = [line + "\n" for line in cleaned_p3.splitlines()]
+        elif "# 💾 EXPORT TRAINED CHECKPOINTS" in src_text:
+            cell_copy["source"] = export_lines
+
+        cells.append(cell_copy)
+
+    return cells
 
 
 def prepare_bundle():
@@ -1680,10 +2003,8 @@ def prepare_bundle():
         _build_cells("AXE Genesis PyTorch Meta-Learner & Q-Executor Pipeline (Kaggle GPU)"),
         PYTORCH_NOTEBOOK_PATH,
     )
-    # Keras notebook: identical PyTorch pipeline, different filename/title.
-    # The original notebook had dead TF/Keras GPU setup that was never used — removed.
     generate_notebook(
-        _build_cells("AXE Genesis PyTorch Pipeline (Kaggle GPU — Keras Dataset Slot)"),
+        _build_keras_cells("AXE Genesis Keras Meta-Learner & Q-Executor Pipeline"),
         KERAS_NOTEBOOK_PATH,
     )
 

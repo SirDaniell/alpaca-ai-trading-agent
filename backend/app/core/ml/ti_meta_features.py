@@ -14,8 +14,8 @@ import pandas as pd
 
 from app.core.analysis.technical_indicators import IndicatorConfig, TechnicalIndicators
 
-SIGNAL_META_LOOKBACK_BARS = 1000
-SIGNAL_META_FEATURE_CONTRACT_VERSION = "signal-meta-ti-seq-1000-v1"
+SIGNAL_META_LOOKBACK_BARS = 150   # 12h of 5m data — matches notebook meta_lookback_bars
+SIGNAL_META_FEATURE_CONTRACT_VERSION = "signal-meta-ti-seq-150-v2"
 
 
 _SKIP_COLUMNS = {

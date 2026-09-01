@@ -26,6 +26,7 @@ import torch.optim as optim
 from app.core.ml.instrument_metadata import get_instrument_metadata
 from app.core.ml.ti_meta_features import (
     DECISION_FEATURE_KEYS,
+    DECISION_FEATURE_COUNT,
     DECISION_WINDOW_DIM,
     SIGNAL_META_FEATURE_CONTRACT_VERSION,
     SIGNAL_META_LOOKBACK_BARS,
@@ -34,8 +35,11 @@ from app.core.ml.ti_meta_features import (
 logger = logging.getLogger(__name__)
 
 SIGNAL_META_FEATURE_KEYS = tuple(DECISION_FEATURE_KEYS)
-SIGNAL_META_FEATURE_COUNT = DECISION_WINDOW_DIM
+SIGNAL_META_FEATURE_COUNT = DECISION_FEATURE_COUNT
 SIGNAL_META_HORIZON_BARS = 24
+
+META_PREDICT_WINDOW = 150   # bars fed to the network at predict time (150-bar "prompt")
+# Note: SIGNAL_META_LOOKBACK_BARS=1000 stays — it controls TI feature computation depth only
 
 # Target normalization constants for auxiliary heads
 TARGET_PIP_SCALE = 100.0        # Scale pips, MFE, MAE by 100.0 so target range is ~[0.0 - 5.0]
@@ -184,6 +188,9 @@ class ForwardMoveRewardCalculator:
         next_zone_dist_atr: Optional[float] = None,
         next_zone_type: Optional[float] = None,
         reversal_prob: Optional[float] = None,
+        vol_regime: float = 0.0,
+        vel_net: float = 0.0,
+        zone_idx: float = 0.0,
     ) -> ForwardMoveStats:
         """
         Compute multi-horizon forward move stats for a signal over [1, 3, 6, 12] bars.
@@ -310,6 +317,9 @@ class PrioritizedReplayBuffer:
         next_zone_dist_atr: float = 0.0,
         next_zone_type: float = 0.0,
         reversal_prob: float = 0.0,
+        vol_regime: float = 0.0,      # Volatility_Regime_next target
+        vel_net: float = 0.0,         # Price_Velocity_Net_next target
+        zone_idx: float = 0.0,        # adv_target_next_zone_idx target (0-6)
         transition_id: Optional[str] = None,
         priority: Optional[float] = None,
     ):
@@ -337,6 +347,9 @@ class PrioritizedReplayBuffer:
             'next_zone_dist_atr': float(next_zone_dist_atr),
             'next_zone_type': float(next_zone_type),
             'reversal_prob': float(reversal_prob),
+            'vol_regime':   float(vol_regime),
+            'vel_net':      float(vel_net),
+            'zone_idx':     float(zone_idx),
             'transition_id': transition_id,
         }
 
@@ -358,7 +371,14 @@ class PrioritizedReplayBuffer:
         current_size = len(self.buffer)
         prios = self.priorities[:current_size]
         probs = prios ** self.alpha
-        probs /= probs.sum()
+        probs_sum = probs.sum()
+        if not np.isfinite(probs_sum) or probs_sum == 0:
+            probs = np.ones(current_size, dtype=np.float64) / current_size
+        else:
+            probs /= probs_sum
+        # Final NaN/inf guard — fall back to uniform if any element is bad
+        if not np.all(np.isfinite(probs)):
+            probs = np.ones(current_size, dtype=np.float64) / current_size
 
         indices = np.random.choice(current_size, size=min(batch_size, current_size), p=probs, replace=False)
         total = current_size
@@ -377,6 +397,9 @@ class PrioritizedReplayBuffer:
         next_zone_dist_atr = np.array([self.buffer[idx].get('next_zone_dist_atr', 0.0) for idx in indices])
         next_zone_type = np.array([self.buffer[idx].get('next_zone_type', 0.0) for idx in indices])
         reversal_prob = np.array([self.buffer[idx].get('reversal_prob', 0.0) for idx in indices])
+        vol_regime    = np.array([self.buffer[idx].get('vol_regime', 0.0)   for idx in indices])
+        vel_net       = np.array([self.buffer[idx].get('vel_net',    0.0)   for idx in indices])
+        zone_idx      = np.array([self.buffer[idx].get('zone_idx',   0.0)   for idx in indices])
 
         batch = {
             'states': torch.tensor(states, dtype=torch.float32),
@@ -390,6 +413,9 @@ class PrioritizedReplayBuffer:
             'next_zone_dist_atr': torch.tensor(next_zone_dist_atr, dtype=torch.float32),
             'next_zone_type': torch.tensor(next_zone_type, dtype=torch.float32),
             'reversal_prob': torch.tensor(reversal_prob, dtype=torch.float32),
+            'vol_regime':    torch.tensor(vol_regime,    dtype=torch.float32),
+            'vel_net':       torch.tensor(vel_net,       dtype=torch.float32),
+            'zone_idx':      torch.tensor(zone_idx,      dtype=torch.float32),
         }
 
         return batch, indices, weights
@@ -439,6 +465,9 @@ class PrioritizedReplayBuffer:
                 next_zone_dist_atr=float(transition.get('next_zone_dist_atr', 0.0)),
                 next_zone_type=float(transition.get('next_zone_type', 0.0)),
                 reversal_prob=float(transition.get('reversal_prob', 0.0)),
+                vol_regime=float(transition.get('vol_regime', 0.0)),
+                vel_net=float(transition.get('vel_net', 0.0)),
+                zone_idx=float(transition.get('zone_idx', 0.0)),
                 transition_id=str(transition.get('transition_id', f'restored-{index}')),
                 priority=float(payload.get('priorities', [1.0] * (index + 1))[index]),
             )
@@ -646,7 +675,7 @@ class OnlineSignalMetaLearner:
 
     def __init__(
         self,
-        input_dim: int = DECISION_WINDOW_DIM,
+        input_dim: int = META_PREDICT_WINDOW * DECISION_FEATURE_COUNT,
         num_actions: int = 4,
         lr: float = 1e-3,
         gamma: float = 0.95,
@@ -658,6 +687,7 @@ class OnlineSignalMetaLearner:
         self.gamma = gamma
         self.total_steps = 0
         self.lookback_bars = lookback_bars
+        self.meta_predict_window = META_PREDICT_WINDOW
         hidden_dim = _hidden_dim_for(input_dim)
 
         self.net = SignalMetaNetwork(input_dim=input_dim, num_actions=num_actions, hidden_dim=hidden_dim)
@@ -671,7 +701,8 @@ class OnlineSignalMetaLearner:
             lookforward_bars=SIGNAL_META_HORIZON_BARS,
         )
         self.feature_keys = list(SIGNAL_META_FEATURE_KEYS)
-        self.feature_contract_version = SIGNAL_META_FEATURE_CONTRACT_VERSION
+        # Updated contract version to reflect 150-bar prompt window
+        self.feature_contract_version = "signal-meta-ti-seq-150-v2"
         # Scaler fitted on training data only; frozen thereafter
         self.scaler = FeatureScaler()
 
@@ -694,31 +725,74 @@ class OnlineSignalMetaLearner:
         if isinstance(feature_input, np.ndarray):
             arr = np.asarray(feature_input, dtype=np.float32)
             if arr.ndim == 2:
-                vec = arr.reshape(-1)
+                # Slice to 150-bar prompt window (take most recent bars)
+                if arr.shape[0] > META_PREDICT_WINDOW:
+                    arr = arr[-META_PREDICT_WINDOW:, :]
+                elif arr.shape[0] < META_PREDICT_WINDOW:
+                    # left-pad with zeros if we have fewer than 150 bars
+                    pad = np.zeros((META_PREDICT_WINDOW - arr.shape[0], arr.shape[1]), dtype=np.float32)
+                    arr = np.vstack([pad, arr])
+                # Apply per-column scaler to each row before flattening so the
+                # scaler (fitted on 238-dim vectors) works correctly on the 2D window.
+                if self.scaler.fitted and arr.shape[1] == len(self.scaler.mean_):
+                    arr = self.scaler.transform(arr)  # (150, 238) → (150, 238)
+                np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                vec = arr.reshape(-1)  # (35700,)
+                # Pad/trim to input_dim and return directly (scaler already applied)
+                if len(vec) < self.input_dim:
+                    vec = np.concatenate([np.zeros(self.input_dim - len(vec), dtype=np.float32), vec])
+                return vec[:self.input_dim]
             else:
                 vec = np.where(np.isfinite(arr.reshape(-1)), arr.reshape(-1), 0.0)
         elif isinstance(feature_input, (list, tuple)):
+            # Treat as a flat feature bar → build (1, N) and route through 2D path
             raw = [float(x) if x is not None and np.isfinite(float(x)) else 0.0 for x in feature_input]
-            vec = np.array(raw, dtype=np.float32)
+            arr = np.array(raw, dtype=np.float32).reshape(1, -1)
+            # Trim/pad columns to match feature_keys width
+            n_keys = len(self.feature_keys)
+            if arr.shape[1] > n_keys:
+                arr = arr[:, :n_keys]
+            elif arr.shape[1] < n_keys:
+                pad = np.zeros((1, n_keys - arr.shape[1]), dtype=np.float32)
+                arr = np.hstack([arr, pad])
+            # Route through 2D path (will pad to META_PREDICT_WINDOW and scale)
+            feature_input = arr  # fall through to 2D ndarray handling below via recursion-free redirect
+            arr_2d = feature_input
+            if arr_2d.shape[0] < META_PREDICT_WINDOW:
+                pad2 = np.zeros((META_PREDICT_WINDOW - arr_2d.shape[0], arr_2d.shape[1]), dtype=np.float32)
+                arr_2d = np.vstack([pad2, arr_2d])
+            if self.scaler.fitted and arr_2d.shape[1] == len(self.scaler.mean_):
+                arr_2d = self.scaler.transform(arr_2d)
+            np.nan_to_num(arr_2d, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            vec = arr_2d.reshape(-1)
+            if len(vec) < self.input_dim:
+                vec = np.concatenate([np.zeros(self.input_dim - len(vec), dtype=np.float32), vec])
+            return vec[:self.input_dim]
         elif isinstance(feature_input, dict):
-            per_bar = []
-            for key in self.feature_keys:
+            # Single-bar inference dict → place the bar at the end of a META_PREDICT_WINDOW window
+            per_bar = np.zeros(len(self.feature_keys), dtype=np.float32)
+            for i, key in enumerate(self.feature_keys):
                 val = float(feature_input.get(key, 0.0))
-                if math.isnan(val) or math.isinf(val):
-                    val = 0.0
-                per_bar.append(val)
-            # Last-bar dict → pad left so the live bar is the last of 48
-            window = np.zeros((self.lookback_bars, len(self.feature_keys)), dtype=np.float32)
-            window[-1] = np.array(per_bar, dtype=np.float32)
-            vec = window.reshape(-1)
+                per_bar[i] = 0.0 if (math.isnan(val) or math.isinf(val)) else val
+            arr_2d = np.zeros((META_PREDICT_WINDOW, len(self.feature_keys)), dtype=np.float32)
+            arr_2d[-1] = per_bar  # live bar is the last row; all prior rows stay zero
+            if self.scaler.fitted and arr_2d.shape[1] == len(self.scaler.mean_):
+                arr_2d = self.scaler.transform(arr_2d)  # (150, 238) → scaled (150, 238)
+            np.nan_to_num(arr_2d, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            vec = arr_2d.reshape(-1)  # (35700,)
+            if len(vec) < self.input_dim:
+                vec = np.concatenate([np.zeros(self.input_dim - len(vec), dtype=np.float32), vec])
+            return vec[:self.input_dim]
         else:
             vec = np.zeros(self.input_dim, dtype=np.float32)
+            return vec
 
+        # 1D ndarray fallback (legacy flat vector path — scaler NOT applied to avoid shape mismatch)
         if len(vec) < self.input_dim:
             vec = np.concatenate([np.zeros(self.input_dim - len(vec), dtype=np.float32), vec])
         vec = vec[:self.input_dim]
-        # Apply frozen scaler (no-op if not yet fitted)
-        return self.scaler.transform(vec)
+        np.nan_to_num(vec, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        return vec
 
     def predict(
         self,
@@ -781,6 +855,9 @@ class OnlineSignalMetaLearner:
         next_zone_dist_atr: Optional[float] = None,
         next_zone_type: Optional[float] = None,
         reversal_prob: Optional[float] = None,
+        vol_regime: float = 0.0,
+        vel_net: float = 0.0,
+        zone_idx: float = 0.0,
     ) -> ForwardMoveStats:
         """
         Record a multi-horizon transition into the prioritized experience replay queue.
@@ -817,6 +894,9 @@ class OnlineSignalMetaLearner:
             next_zone_dist_atr=stats.next_zone_dist_atr,
             next_zone_type=stats.next_zone_type,
             reversal_prob=stats.reversal_prob,
+            vol_regime=vol_regime,
+            vel_net=vel_net,
+            zone_idx=zone_idx,
             transition_id=signal_id,
             priority=priority,
         )
@@ -840,8 +920,11 @@ class OnlineSignalMetaLearner:
         mfe_pips = batch['mfe_pips']
         mae_pips = batch['mae_pips']
         next_zone_dist_atr = batch['next_zone_dist_atr']
-        next_zone_type = batch['next_zone_type']
-        reversal_prob = batch['reversal_prob']
+        next_zone_type     = batch['next_zone_type']
+        reversal_prob      = batch['reversal_prob']
+        vol_regime_t       = batch['vol_regime']
+        vel_net_t          = batch['vel_net']
+        zone_idx_t         = batch['zone_idx']
         weights_t = torch.tensor(weights, dtype=torch.float32)
 
         q_vals, strength_pred, pips_pred, risk_pred, liquidity_pred, reversal_pred, aux1, aux2, selector_logits = self.net(states, return_aux=True)
@@ -900,17 +983,52 @@ class OnlineSignalMetaLearner:
         best_horizon_idx = strength_pred.detach().argmax(dim=1).long()
         loss_selector = nn.functional.cross_entropy(selector_logits, best_horizon_idx)
 
+        # ── Zone / Volatility / Velocity ML target losses ─────────────────────
+        # These mirror the notebook Cell 7 l_zone / l_vol / l_vel terms.
+        # zone_idx is a 0-6 class label → MSE proxy (same as notebook l_zone)
+        # vol_regime is continuous [0,1] → MSE on strength head slot 0
+        # vel_net is signed [-1,1]  → SmoothL1 on pips head slot 3
+
+        loss_zone = nn.functional.mse_loss(
+            q_vals[:, 0],  # proxy: use 5m q-head as zone-index proxy (same as notebook)
+            zone_idx_t / 6.0,  # normalise 0-6 → 0-1
+        ) * 0.05
+
+        # vol_regime drives strength head slot 0 (same as notebook l_vol term 1)
+        loss_vol = nn.functional.mse_loss(
+            strength_pred[:, 0],
+            vol_regime_t.clamp(0.0, 1.0),
+        ) * 0.05
+
+        # vel_net drives pips head slot 3 (same as notebook l_vel term 3)
+        loss_vel = nn.functional.smooth_l1_loss(
+            pips_pred[:, 3],
+            vel_net_t.clamp(-3.0, 3.0),
+        ) * 0.05
+
+        # ── Zone / Volatility / Velocity ML target losses ──────────────
+        # Mirrors notebook Cell 7 l_zone / l_vol / l_vel.
+        loss_zone = nn.functional.mse_loss(
+            q_vals[:, 0], (zone_idx_t / 6.0).clamp(0.0, 1.0)) * 0.05
+        loss_vol = nn.functional.mse_loss(
+            strength_pred[:, 0], vol_regime_t.clamp(0.0, 1.0)) * 0.05
+        loss_vel = nn.functional.smooth_l1_loss(
+            pips_pred[:, 3], vel_net_t.clamp(-3.0, 3.0)) * 0.05
+
         # Balanced Total Loss
         total_loss = (
             loss_q
             + loss_strength
-            + 0.3 * loss_pips
-            + 0.3 * loss_risk
+            + 0.3  * loss_pips
+            + 0.3  * loss_risk
             + 0.05 * loss_liquidity
-            + 0.3 * loss_reversal
+            + 0.3  * loss_reversal
             + 0.15 * loss_aux1
             + 0.15 * loss_aux2
-            + 0.3 * loss_selector   # fusion routing supervision
+            + 0.3  * loss_selector
+            + 0.15 * loss_zone
+            + 0.10 * loss_vol
+            + 0.10 * loss_vel
         )
 
         self.optimizer.zero_grad()
@@ -930,16 +1048,20 @@ class OnlineSignalMetaLearner:
         self.replay_buffer.update_priorities(indices, new_prios)
 
         return {
-            'loss': float(total_loss.item()),
-            'loss_q': float(loss_q.item()),
-            'loss_strength': float(loss_strength.item()),
-            'loss_pips': float(loss_pips.item()),
-            'loss_risk': float(loss_risk.item()),
+            'loss':           float(total_loss.item()),
+            'loss_q':         float(loss_q.item()),
+            'loss_strength':  float(loss_strength.item()),
+            'loss_pips':      float(loss_pips.item()),
+            'loss_risk':      float(loss_risk.item()),
             'loss_liquidity': float(loss_liquidity.item()),
-            'loss_reversal': float(loss_reversal.item()),
-            'loss_aux1': float(loss_aux1.item()),
-            'loss_aux2': float(loss_aux2.item()),
-            'buffer_size': len(self.replay_buffer),
+            'loss_reversal':  float(loss_reversal.item()),
+            'loss_aux1':      float(loss_aux1.item()),
+            'loss_aux2':      float(loss_aux2.item()),
+            'loss_selector':  float(loss_selector.item()),
+            'loss_zone':      float(loss_zone.item()),
+            'loss_vol':       float(loss_vol.item()),
+            'loss_vel':       float(loss_vel.item()),
+            'buffer_size':    len(self.replay_buffer),
         }
 
 
@@ -959,6 +1081,7 @@ class OnlineSignalMetaLearner:
             'feature_keys': list(self.feature_keys),
             'horizon_bars': SIGNAL_META_HORIZON_BARS,
             'lookback_bars': self.lookback_bars,
+            'meta_predict_window': self.meta_predict_window,
             'network': self.net.state_dict(),
             'target_network': self.target_net.state_dict(),
             'optimizer': self.optimizer.state_dict(),
@@ -985,6 +1108,11 @@ class OnlineSignalMetaLearner:
             raise ValueError('Checkpoint horizon does not match learner')
         if int(payload.get('lookback_bars', SIGNAL_META_LOOKBACK_BARS)) != self.lookback_bars:
             raise ValueError('Checkpoint lookback does not match learner')
+        stored_window = int(payload.get('meta_predict_window', 1000))
+        if stored_window != self.meta_predict_window:
+            raise ValueError(
+                f'Checkpoint meta_predict_window={stored_window} does not match learner ({self.meta_predict_window})'
+            )
 
         self.net.load_state_dict(payload['network'])
         self.target_net.load_state_dict(payload['target_network'])

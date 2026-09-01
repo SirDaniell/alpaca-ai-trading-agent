@@ -1,0 +1,302 @@
+{
+  "pbtResults": {},
+  "executionHistory": {
+    "1. Write bug condition exploration tests (BEFORE implementing the fix)": [
+      {
+        "executionId": "0a77cf09-3f9e-4546-ae12-196642eaeaf6",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788234289557
+      },
+      {
+        "executionId": "0a77cf09-3f9e-4546-ae12-196642eaeaf6",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788234602121
+      },
+      {
+        "executionId": "c53d831f-657f-40c2-98a6-6e4b78f5d871",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788235772402
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236052713
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236064381
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236071322
+      }
+    ],
+    "2. Write preservation property tests (BEFORE implementing the fix)": [
+      {
+        "executionId": "0a77cf09-3f9e-4546-ae12-196642eaeaf6",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788234289799
+      },
+      {
+        "executionId": "3e9300fc-0aeb-4a5b-9178-06551bb2db79",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788235152839
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236052796
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236076356
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236239452
+      }
+    ],
+    "3.1 Resolve HTF column names dynamically from the `timeframe` parameter": [
+      {
+        "executionId": "0a77cf09-3f9e-4546-ae12-196642eaeaf6",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788234289908
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236052859
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236243925
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236703255
+      }
+    ],
+    "3.2 Call `update_real_snr_snapshot()` once per HTF at the same cadence as today": [
+      {
+        "executionId": "0a77cf09-3f9e-4546-ae12-196642eaeaf6",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788234289990
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236052920
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236707871
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236716557
+      }
+    ],
+    "4.1 Add per-TF SNR distance columns for `15m`, `1h`, `4h`": [
+      {
+        "executionId": "0a77cf09-3f9e-4546-ae12-196642eaeaf6",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788234290052
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236052993
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236723842
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236730596
+      }
+    ],
+    "4.2 Replace rolling-quantile confluence with real zone-proximity confluence": [
+      {
+        "executionId": "0a77cf09-3f9e-4546-ae12-196642eaeaf6",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788234290149
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236053057
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236736019
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236740662
+      }
+    ],
+    "5.1 Read `rsi_1h` from the current row and derive `htf_bias`": [
+      {
+        "executionId": "0a77cf09-3f9e-4546-ae12-196642eaeaf6",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788234290204
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236053119
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236746881
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236751802
+      }
+    ],
+    "5.2 Apply the HTF gate to filter contradicting training samples": [
+      {
+        "executionId": "0a77cf09-3f9e-4546-ae12-196642eaeaf6",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788234290266
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236053233
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236759312
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236764101
+      }
+    ],
+    "6. Verify exploration test (Property 1) now passes after the fix": [
+      {
+        "executionId": "0a77cf09-3f9e-4546-ae12-196642eaeaf6",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788234290321
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236053331
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236782589
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788237325677
+      }
+    ],
+    "7. Verify preservation tests (Property 2) still pass after the fix": [
+      {
+        "executionId": "0a77cf09-3f9e-4546-ae12-196642eaeaf6",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788234290377
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236053393
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788237331703
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788237337237
+      }
+    ],
+    "8. Write unit tests for all targeted fix surfaces": [
+      {
+        "executionId": "0a77cf09-3f9e-4546-ae12-196642eaeaf6",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788234290435
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236053457
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788237342028
+      }
+    ],
+    "9. Write property-based tests for stronger universal guarantees": [
+      {
+        "executionId": "0a77cf09-3f9e-4546-ae12-196642eaeaf6",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788234290495
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236053521
+      }
+    ],
+    "10. Checkpoint — Ensure all tests pass": [
+      {
+        "executionId": "0a77cf09-3f9e-4546-ae12-196642eaeaf6",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788234290556
+      },
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236053586
+      }
+    ],
+    "3. Fix `update_real_snr_snapshot()` — dynamic HTF column selection": [
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236716627
+      }
+    ],
+    "4. Fix `compute_full_context_features()` — per-TF SNR distance columns + real confluence": [
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236740812
+      }
+    ],
+    "5. Fix Phase 1 training loop — add HTF confirmation gate before `record_experience()`": [
+      {
+        "executionId": "e71f0859-eec9-4fd8-8e23-3603d8a06127",
+        "chatSessionId": "sess_a10c8613-1ce2-435c-bf4f-3e27bcfe1f25",
+        "timestamp": 1788236764244
+      }
+    ]
+  }
+}

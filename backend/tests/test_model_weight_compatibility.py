@@ -15,35 +15,59 @@ from app.core.ml.signal_meta_learner import SignalMetaNetwork as LocalSignalMeta
 from app.core.options.q_executor import ExecutorQNetwork as LocalExecutorQNetwork
 
 
-def get_notebook_model_classes():
-    """Extract and execute only the PYTORCH_MODELS cell from the generated Kaggle Notebook."""
-    with open("kaggle_axe_meta_learner_training.ipynb", "r") as f:
-        nb = json.load(f)
-    
-    # Locate the cell containing model definitions
-    model_cell_code = ""
-    for cell in nb["cells"]:
-        if cell["cell_type"] == "code":
-            src = "".join(cell["source"])
-            if "class SignalMetaNetwork" in src and "class ExecutorQNetwork" in src:
-                model_cell_code = src
-                break
-
-    if not model_cell_code:
-        raise ValueError("Could not find model definition cell in notebook.")
-
-    # Execute isolated cell in namespace
-    ns = {
+def _make_exec_ns():
+    """Shared exec namespace with all required symbols."""
+    import typing
+    return {
         "torch": torch,
         "nn": nn,
         "np": np,
-        "input_dim": 1000 * 238,
+        "Optional": typing.Optional,
+        "List": typing.List,
+        "Dict": typing.Dict,
+        "Tuple": typing.Tuple,
+        "Any": typing.Any,
+        "Union": typing.Union,
+        "meta_lookback_bars": 150,
+        "q_lookback_bars": 300,
+        "Q_LOOKBACK": 300,
+        "lookback_bars": 150,
+        "input_dim": 150 * 238,
         "num_features": 238,
-        "lookback_bars": 1000,
         "train_df": type("DF", (), {"columns": [f"f_{i}" for i in range(238)]})()
     }
-    exec(model_cell_code, ns)
-    return ns["SignalMetaNetwork"], ns["ExecutorQNetwork"]
+
+
+def get_notebook_model_classes():
+    """Extract SignalMetaNetwork and ExecutorQNetwork from the generated Kaggle Notebook.
+    The notebook now follows the source notebook structure: each class is in its own cell.
+    """
+    with open("kaggle_axe_meta_learner_training.ipynb", "r") as f:
+        nb = json.load(f)
+
+    meta_cell = eq_cell = None
+    for cell in nb["cells"]:
+        if cell["cell_type"] == "code":
+            src = "".join(cell["source"])
+            if "class SignalMetaNetwork" in src and meta_cell is None:
+                meta_cell = src
+            if "class ExecutorQNetwork" in src and eq_cell is None:
+                eq_cell = src
+
+    if meta_cell is None:
+        raise ValueError("Could not find SignalMetaNetwork cell in notebook.")
+    if eq_cell is None:
+        raise ValueError("Could not find ExecutorQNetwork cell in notebook.")
+
+    # Execute SignalMetaNetwork cell
+    meta_ns = _make_exec_ns()
+    exec(meta_cell, meta_ns)
+
+    # ExecutorQNetwork cell needs num_features and Q_LOOKBACK in scope
+    eq_ns = _make_exec_ns()
+    exec(eq_cell, eq_ns)
+
+    return meta_ns["SignalMetaNetwork"], eq_ns["ExecutorQNetwork"]
 
 
 def test_signal_meta_network_weight_compatibility():
@@ -51,7 +75,7 @@ def test_signal_meta_network_weight_compatibility():
     NotebookSignalMetaNetwork, _ = get_notebook_model_classes()
 
     num_features = 238
-    lookback_bars = 1000
+    lookback_bars = 150
     input_dim = lookback_bars * num_features
 
     local_model = LocalSignalMetaNetwork(input_dim=input_dim, num_features=num_features)
@@ -93,8 +117,12 @@ def test_executor_q_network_weight_compatibility():
     """Verify ExecutorQNetwork state_dict key and shape parity between Notebook and Local code."""
     _, NotebookExecutorQNetwork = get_notebook_model_classes()
 
-    local_model = LocalExecutorQNetwork(input_dim=28, hidden_dim=64, num_actions=5)
-    notebook_model = NotebookExecutorQNetwork(input_dim=28, hidden_dim=64, num_actions=5)
+    num_features = 238
+    ctx_dim = 28
+    q_lookback = 300
+
+    local_model = LocalExecutorQNetwork(num_features=num_features, ctx_dim=ctx_dim, q_lookback=q_lookback)
+    notebook_model = NotebookExecutorQNetwork(num_features=num_features, ctx_dim=ctx_dim, q_lookback=q_lookback)
 
     local_keys = set(local_model.state_dict().keys())
     notebook_keys = set(notebook_model.state_dict().keys())
@@ -115,13 +143,15 @@ def test_executor_q_network_weight_compatibility():
     local_model.load_state_dict(notebook_model.state_dict())
 
     # Forward pass test for numerical identity
-    x_test = torch.randn(4, 28)
+    fw_test = torch.randn(4, q_lookback, num_features)
+    ctx_test = torch.randn(4, ctx_dim)
     local_model.eval()
     notebook_model.eval()
 
     with torch.no_grad():
-        loc_out = local_model(x_test)
-        nb_out = notebook_model(x_test)
+        loc_out = local_model(fw_test, ctx_test)
+        nb_out = notebook_model(fw_test, ctx_test)
 
     assert torch.allclose(loc_out, nb_out, atol=1e-5), "Executor Q-values mismatch between local and notebook models"
     print("✅ ExecutorQNetwork state_dict & forward pass outputs are 100% identical!")
+

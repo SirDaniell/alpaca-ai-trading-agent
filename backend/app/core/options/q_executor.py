@@ -7,10 +7,16 @@ Roles:
 - Applies HardActionMask to enforce no-chase entry discipline and volume delta confirmation.
 - Implements Bias-Persistence Re-Entry (fixed risk sizing, NO martingale scaling).
 - Evaluates delayed risk-adjusted rewards with overtrade churn penalties and training-time hindsight missed-opportunity shaping.
+
+Architecture (Task 5 upgrade):
+- Dual-input ExecutorQNetwork: Branch A (Conv1D over feature window) + Branch B (dense context encoder).
+- 4 independent horizon heads: WAIT(0) / CALL(1) / PUT(2) per horizon.
+- build_feat_window / build_feat_window_batch helpers for lookahead-free window construction.
 """
 
 from __future__ import annotations
 
+import collections
 import logging
 import random
 from dataclasses import dataclass, field
@@ -33,6 +39,25 @@ ACTION_TAKE_PROFIT_HALF = 3
 ACTION_CLOSE_FLATTEN = 4
 NUM_ACTIONS = 5
 EXECUTOR_STATE_DIM = 28  # Compact representation for LTF execution context + Multi-Horizon hints
+Q_LOOKBACK = 300         # bars of full indicators fed to Q-executor (zone analyzer)
+
+HORIZON_BARS_LIST   = [1, 3, 6, 12]  # 5m, 15m, 30m, 1h
+REGRET_MIN_PCT      = 0.0015         # min missed move to record as regret
+REGRET_REWARD_SCALE = 5.0            # amplifier for regret signal
+
+from collections import namedtuple
+
+RegretTransition = namedtuple('RegretTransition', [
+    'feat_window',        # (Q_LOOKBACK, F) numpy array — current bar's indicator window
+    'ctx_state',          # (28,) numpy array — current 28-dim context
+    'action',             # always ACTION_WAIT (0) — the missed action
+    'regret_reward',      # float, negative — -abs(fwd_pct) * REGRET_REWARD_SCALE, capped -3.0
+    'next_feat_window',   # (Q_LOOKBACK, F) numpy array — next bar
+    'next_ctx_state',     # (28,) numpy array — next bar context
+    'next_action_mask',   # (3,) numpy array
+    'horizon_idx',        # int 0-3 — which horizon was the profitable one
+    'counterfactual_pct', # float — what % move was missed
+])
 
 
 @dataclass
@@ -83,83 +108,140 @@ class ExecutionContext:
 
 class ExecutorQNetwork(nn.Module):
     """
-    Two-Branch Ensemble Deep Q-Network for LTF Options Execution.
-    Mirrors build_classification_ensemble_model (tt.py) architecture:
-    - Branch 1 (Dense Feature Tower): Deep representation over all 28 state features with LayerNorm & SiLU.
-    - Branch 2 (Multi-Scale Grouped Tower): Grouped projections over Meta-Learner (0..9), Risk (10..14), Zone (15..22), and Time (23..27) features.
-    - Supervised Aux Heads (aux1_head, aux2_head): Independent aux predictions per branch before fusion.
-    - StopGradient Isolation: aux1 & aux2 predictions are detached before feeding into Gated Fusion Layer.
-    - Gated Ensemble Fusion Head: Combines b1_out, b2_out, aux1_detached, aux2_detached for robust Q-value estimation.
+    Dual-branch Q-network for LTF options execution (matches notebook Cell 6).
+    Branch A — Conv1D over the raw indicator feature window (B, T, F).
+    Branch B — Dense over the 28-dim meta/zone/account/time context.
+    Fusion   — 4 horizon heads × 3 actions (WAIT=0 / CALL=1 / PUT=2).
     """
 
-    def __init__(self, input_dim: int = EXECUTOR_STATE_DIM, hidden_dim: int = 64, num_actions: int = NUM_ACTIONS):
+    def __init__(
+        self,
+        num_features: int,
+        input_dim: int = EXECUTOR_STATE_DIM,  # kept for backward compat
+        hidden_dim: int = 128,
+        num_actions: int = NUM_ACTIONS,
+        ctx_dim: int = EXECUTOR_STATE_DIM,
+        q_lookback: int = Q_LOOKBACK,
+        num_horizons: int = 4,
+        num_head_actions: int = 3,
+    ):
         super().__init__()
-        # Branch 1: Dense Feature Extraction Tower (Halved)
-        self.b1_fc1 = nn.Linear(input_dim, hidden_dim)
+        self.num_features = num_features
+        self.ctx_dim = ctx_dim
+        self.q_lookback = q_lookback
+        self.num_horizons = num_horizons
+
+        # --- Branch A: full indicator window (B, T, F) → channels-first Conv1D ---
+        self.feat_conv1 = nn.Conv1d(num_features, 64, kernel_size=3, padding=1)
+        self.feat_bn1   = nn.BatchNorm1d(64)
+        self.feat_conv2 = nn.Conv1d(64, 64, kernel_size=3, padding=1)
+        self.feat_bn2   = nn.BatchNorm1d(64)
+        self.feat_pool  = nn.AdaptiveAvgPool1d(1)
+        self.feat_fc    = nn.Linear(64, 64)
+
+        # --- Branch B: 28-dim context dense encoder ---
+        self.b1_fc1 = nn.Linear(ctx_dim, hidden_dim)
         self.b1_ln1 = nn.LayerNorm(hidden_dim)
-        self.b1_act1 = nn.SiLU()
-        self.b1_drop = nn.Dropout(0.0)
-        self.b1_fc2 = nn.Linear(hidden_dim, 32)
-        self.b1_ln2 = nn.LayerNorm(32)
-        self.b1_act2 = nn.SiLU()
+        self.b1_fc2 = nn.Linear(hidden_dim, 64)
+        self.b1_ln2 = nn.LayerNorm(64)
 
-        # Branch 2: Multi-Scale Grouped Feature Tower (Halved)
-        # Slice inputs into 4 semantic sub-groups: Meta (10), Risk (5), Zone (8), Time (5)
-        self.b2_meta = nn.Linear(10, 16)
-        self.b2_risk = nn.Linear(5, 16)
-        self.b2_zone = nn.Linear(8, 16)
-        self.b2_time = nn.Linear(5, 16)
-        self.b2_fusion = nn.Linear(64, 32)
-        self.b2_ln = nn.LayerNorm(32)
-        self.b2_act = nn.SiLU()
+        self.b2_meta   = nn.Linear(10, 16)
+        self.b2_risk   = nn.Linear(5, 16)
+        self.b2_zone   = nn.Linear(8, 16)
+        self.b2_time   = nn.Linear(5, 16)
+        self.b2_fusion = nn.Linear(64, 64)
+        self.b2_ln     = nn.LayerNorm(64)
 
-        # Auxiliary Supervised Heads (1 per branch, Halved)
-        self.aux1_head = nn.Linear(32, num_actions)
-        self.aux2_head = nn.Linear(32, num_actions)
+        # --- Fusion + per-horizon heads ---
+        self.fusion_fc = nn.Linear(64 + 64 + 64, hidden_dim)  # feat_h + b1_out + b2_out
+        self.fusion_ln = nn.LayerNorm(hidden_dim)
 
-        # Gated Ensemble Fusion Head (Halved)
-        # Inputs: b1_out (32) + b2_out (32) + aux1_detached (4) + aux2_detached (4) = 72
-        self.fusion_fc1 = nn.Linear(32 + 32 + num_actions + num_actions, hidden_dim)
-        self.fusion_ln1 = nn.LayerNorm(hidden_dim)
-        self.fusion_act1 = nn.SiLU()
-        self.fusion_out = nn.Linear(hidden_dim, num_actions)
+        self.horizon_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim, 64),
+                nn.LayerNorm(64),
+                nn.SiLU(),
+                nn.Linear(64, num_head_actions),
+            )
+            for _ in range(num_horizons)
+        ])
 
-    def forward(self, x: torch.Tensor, return_aux: bool = False) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # ── Branch 1 ────────────────────────────────────────────────────────
-        b1 = self.b1_act1(self.b1_ln1(self.b1_fc1(x)))
-        b1 = self.b1_drop(b1)
-        b1_out = self.b1_act2(self.b1_ln2(self.b1_fc2(b1)))
+    def _encode_feat(self, feat_window: torch.Tensor) -> torch.Tensor:
+        """Encode (B, T, F) feature window → (B, 64)."""
+        x = feat_window.transpose(1, 2)                              # (B, F, T)
+        x = torch.nn.functional.silu(self.feat_bn1(self.feat_conv1(x)))
+        x = torch.nn.functional.silu(self.feat_bn2(self.feat_conv2(x)))
+        x = self.feat_pool(x).squeeze(-1)                            # (B, 64)
+        return torch.nn.functional.silu(self.feat_fc(x))
 
-        # ── Branch 2 ────────────────────────────────────────────────────────
-        meta_feats = x[:, :10]
-        risk_feats = x[:, 10:15]
-        zone_feats = x[:, 15:23]
-        time_feats = x[:, 23:28]
+    def _encode_ctx(self, ctx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode 28-dim context → (b1_out(64), b2_out(64))."""
+        b1     = torch.nn.functional.silu(self.b1_ln1(self.b1_fc1(ctx)))
+        b1_out = torch.nn.functional.silu(self.b1_ln2(self.b1_fc2(b1)))
 
-        b2_m = torch.relu(self.b2_meta(meta_feats))
-        b2_r = torch.relu(self.b2_risk(risk_feats))
-        b2_z = torch.relu(self.b2_zone(zone_feats))
-        b2_t = torch.relu(self.b2_time(time_feats))
-        b2_cat = torch.cat([b2_m, b2_r, b2_z, b2_t], dim=-1)
-        b2_out = self.b2_act(self.b2_ln(self.b2_fusion(b2_cat)))
+        meta_f = ctx[:, :10]
+        risk_f = ctx[:, 10:15]
+        zone_f = ctx[:, 15:23]
+        time_f = ctx[:, 23:28]
+        b2_cat = torch.cat([
+            torch.relu(self.b2_meta(meta_f)),
+            torch.relu(self.b2_risk(risk_f)),
+            torch.relu(self.b2_zone(zone_f)),
+            torch.relu(self.b2_time(time_f)),
+        ], dim=-1)
+        b2_out = torch.nn.functional.silu(self.b2_ln(self.b2_fusion(b2_cat)))
+        return b1_out, b2_out
 
-        # ── Independent Auxiliary Heads (Detached feature inputs prevent aux gradient contamination) ──
-        aux1_q = self.aux1_head(b1_out.detach())
-        aux2_q = self.aux2_head(b2_out.detach())
+    def forward(
+        self,
+        feat_window: torch.Tensor,
+        ctx: torch.Tensor,
+        horizon_idx: Optional[int] = None,
+        return_aux: bool = False,
+    ) -> torch.Tensor:
+        """
+        feat_window : (B, Q_LOOKBACK, num_features)
+        ctx         : (B, 28)
+        horizon_idx : int | None  — if set returns (B, 3) for that head only
+                                     otherwise returns (B, 4, 3)
+        return_aux  : kept for API compat, no-op in this architecture
+        """
+        feat_h         = self._encode_feat(feat_window)
+        b1_out, b2_out = self._encode_ctx(ctx)
+        shared = torch.nn.functional.silu(
+            self.fusion_ln(
+                self.fusion_fc(torch.cat([feat_h, b1_out, b2_out], dim=-1))
+            )
+        )
+        if horizon_idx is not None:
+            return self.horizon_heads[int(horizon_idx)](shared)
+        return torch.stack([h(shared) for h in self.horizon_heads], dim=1)
 
-        # ── StopGradient Isolation for Gated Fusion ─────────────────────────
-        aux1_sg = aux1_q.detach()
-        aux2_sg = aux2_q.detach()
 
-        # ── Gated Fusion Layer ───────────────────────────────────────────────
-        fusion_in = torch.cat([b1_out, b2_out, aux1_sg, aux2_sg], dim=-1)
-        fused = self.fusion_act1(self.fusion_ln1(self.fusion_fc1(fusion_in)))
-        q_final = self.fusion_out(fused)
+# ── Module-level feature window helpers ──────────────────────────────────────
 
-        if return_aux:
-            return q_final, aux1_q, aux2_q
-        return q_final
+def build_feat_window(num_matrix: np.ndarray, abs_idx: int, q_lookback: int = Q_LOOKBACK) -> np.ndarray:
+    """
+    Build a (q_lookback, num_features) feature window for the Q-executor.
+    Only uses rows <= abs_idx (no lookahead). Left-pads with zeros if needed.
+    """
+    start = abs_idx - q_lookback + 1
+    if start >= 0:
+        return num_matrix[start: abs_idx + 1].astype(np.float32)
+    # Left-pad with zeros
+    window = np.zeros((q_lookback, num_matrix.shape[1]), dtype=np.float32)
+    available = num_matrix[: abs_idx + 1]
+    window[-len(available):] = available
+    return window
 
+
+def build_feat_window_batch(
+    num_matrix: np.ndarray,
+    abs_indices: Any,
+    q_lookback: int = Q_LOOKBACK,
+) -> np.ndarray:
+    """Vectorised version of build_feat_window for a batch of indices."""
+    return np.stack([build_feat_window(num_matrix, int(i), q_lookback) for i in abs_indices])
 
 
 class OptionsQExecutor:
@@ -169,6 +251,7 @@ class OptionsQExecutor:
 
     def __init__(
         self,
+        num_features: int = 0,
         input_dim: int = EXECUTOR_STATE_DIM,
         lr: float = 1e-4,
         gamma: float = 0.99,
@@ -179,21 +262,23 @@ class OptionsQExecutor:
         device: str = "cpu",
     ):
         self.input_dim = input_dim
+        self.num_features = num_features
         self.gamma = gamma
         self.epsilon = epsilon_start
         self.epsilon_min = epsilon_min
         self.epsilon_decay = epsilon_decay
         self.device = torch.device(device)
 
-        self.policy_net = ExecutorQNetwork(input_dim=input_dim).to(self.device)
-        self.target_net = ExecutorQNetwork(input_dim=input_dim).to(self.device)
+        self.policy_net = ExecutorQNetwork(num_features=num_features, input_dim=input_dim).to(self.device)
+        self.target_net = ExecutorQNetwork(num_features=num_features, input_dim=input_dim).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
 
         self.optimizer = optim.AdamW(self.policy_net.parameters(), lr=lr, weight_decay=1e-4)
         self.action_mask_engine = HardActionMask()
-        self.replay_buffer: List[Tuple[np.ndarray, int, float, np.ndarray, bool, np.ndarray]] = []
+        self.replay_buffer: List[Tuple] = []
         self.buffer_capacity = buffer_capacity
+        self.regret_buffer: collections.deque = collections.deque(maxlen=10_000)
 
     # ── State Representation Construction ────────────────────────────────────
 
@@ -269,41 +354,51 @@ class OptionsQExecutor:
 
         return state
 
-
-
     # ── Action Selection with Hard Action Masking ─────────────────────────────
 
     def select_action(
         self,
         state: np.ndarray,
         action_mask: np.ndarray,
+        feat_window: Optional[np.ndarray] = None,
         eval_mode: bool = False,
         eval_epsilon: float = 0.10,
+        horizon_idx: int = 0,
     ) -> int:
         """
         Select action using Epsilon-Greedy with Hard Action Masking.
         Masked actions (0 in action_mask) are set to -infinity Q-value.
 
+        feat_window : (Q_LOOKBACK, num_features) or None — zeros used if absent.
+        horizon_idx : which horizon head to query (0=5m, 1=15m, 2=30m, 3=1h).
+
         In eval_mode, a small residual epsilon (eval_epsilon) is retained so
         that an undertrained network with WAIT-bias does not collapse to 100%
-        WAIT during Phase 3 assessment. Pure greedy argmax is only valid on a
-        fully-converged policy.
+        WAIT during Phase 3 assessment.
         """
-        valid_actions = np.where(action_mask == 1)[0]
+        # The horizon heads output 3 actions (WAIT/CALL/PUT); map back to full action space
+        # by only masking the first 3 slots; TAKE_PROFIT / CLOSE are positional overrides.
+        # For execution-gate decisions we operate on the 3-action subspace.
+        valid_actions = np.where(action_mask[:3] == 1)[0] if len(action_mask) >= 3 else np.where(action_mask == 1)[0]
         if len(valid_actions) == 0:
             return ACTION_WAIT  # Safe fallback
 
-        # Training: full epsilon-greedy. Eval: residual epsilon to prevent WAIT lock.
         eps = eval_epsilon if eval_mode else self.epsilon
         if random.random() < eps:
             return int(random.choice(valid_actions))
 
         with torch.no_grad():
             t_state = torch.from_numpy(state).unsqueeze(0).to(self.device)
-            q_values = self.policy_net(t_state).squeeze(0).cpu().numpy()
+            if feat_window is not None:
+                t_feat = torch.tensor(feat_window[None, ...], dtype=torch.float32, device=self.device)
+            else:
+                nf = max(self.num_features, 1)
+                t_feat = torch.zeros(1, self.policy_net.q_lookback, nf, dtype=torch.float32, device=self.device)
+            q_values = self.policy_net(t_feat, t_state, horizon_idx=horizon_idx).squeeze(0).cpu().numpy()
 
-        # Apply action mask: set invalid actions to -infinity
-        masked_q = np.where(action_mask == 1, q_values, -1e9)
+        # Apply action mask over the 3-action subspace
+        mask_3 = action_mask[:3] if len(action_mask) >= 3 else action_mask
+        masked_q = np.where(mask_3 == 1, q_values, -1e9)
         return int(np.argmax(masked_q))
 
     # ── Replay Buffer & Training Step ─────────────────────────────────────────
@@ -316,59 +411,154 @@ class OptionsQExecutor:
         next_state: np.ndarray,
         done: bool,
         next_action_mask: np.ndarray,
+        feat_window: Optional[np.ndarray] = None,
+        next_feat_window: Optional[np.ndarray] = None,
     ) -> None:
-        """Record transition into replay buffer."""
+        """
+        Record transition into replay buffer.
+        If feat_window and next_feat_window are provided, stores 7-tuple:
+            (feat_window, state, action, reward, next_feat_window, next_state, done)
+        Otherwise falls back to legacy 6-tuple:
+            (state, action, reward, next_state, done, next_action_mask)
+        """
         if len(self.replay_buffer) >= self.buffer_capacity:
             self.replay_buffer.pop(0)
-        self.replay_buffer.append((state, action, reward, next_state, done, next_action_mask))
+        if feat_window is not None and next_feat_window is not None:
+            self.replay_buffer.append((feat_window, state, action, reward, next_feat_window, next_state, done))
+        else:
+            self.replay_buffer.append((state, action, reward, next_state, done, next_action_mask))
+
+    def record_regret_transition(
+        self,
+        feat_window: np.ndarray,
+        ctx_state: np.ndarray,
+        next_feat_window: np.ndarray,
+        next_ctx_state: np.ndarray,
+        next_action_mask: np.ndarray,
+        htf_bias: "HTFBiasPackage",
+        future_closes: np.ndarray,
+        entry_price: float,
+    ) -> None:
+        """
+        Record a regret transition when ACTION_WAIT was chosen but a profitable
+        entry existed.  Only records for the BEST profitable horizon found.
+
+        Called by the caller AFTER choosing ACTION_WAIT when at least one horizon
+        would have produced |fwd_pct| >= REGRET_MIN_PCT in the correct direction.
+        """
+        for h, bars in enumerate(HORIZON_BARS_LIST):
+            if len(future_closes) < bars:
+                continue
+            fwd_pct = float((future_closes[bars - 1] - entry_price) / (entry_price + 1e-8))
+            is_bullish = htf_bias.direction == "bullish"
+            is_bearish = htf_bias.direction == "bearish"
+            directional = (is_bullish and fwd_pct > 0) or (is_bearish and fwd_pct < 0)
+            if abs(fwd_pct) >= REGRET_MIN_PCT and directional:
+                regret_reward = max(-3.0, -abs(fwd_pct) * REGRET_REWARD_SCALE)
+                self.regret_buffer.append(RegretTransition(
+                    feat_window=feat_window,
+                    ctx_state=ctx_state,
+                    action=ACTION_WAIT,
+                    regret_reward=regret_reward,
+                    next_feat_window=next_feat_window,
+                    next_ctx_state=next_ctx_state,
+                    next_action_mask=next_action_mask,
+                    horizon_idx=h,
+                    counterfactual_pct=fwd_pct,
+                ))
+                return  # Record only for the first profitable horizon found
 
     def train_step(self, batch_size: int = 32) -> Optional[float]:
-        """Perform a single Q-learning gradient update step."""
+        """
+        Perform a single Q-learning gradient update step.
+
+        Supports both 7-tuple (feat_window, ctx, action, reward, next_feat, next_ctx, done)
+        and legacy 6-tuple replay buffer entries.
+        Uses horizon 0 (5m) for the simplified single-step update; the full
+        multi-horizon training is implemented in the notebook Cell 8.
+        """
         if len(self.replay_buffer) < batch_size:
             return None
 
         batch = random.sample(self.replay_buffer, batch_size)
-        states, actions, rewards, next_states, dones, next_masks = zip(*batch)
 
-        t_states = torch.tensor(np.array(states), dtype=torch.float32, device=self.device)
-        t_actions = torch.tensor(actions, dtype=torch.int64, device=self.device).unsqueeze(1)
-        t_rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device).unsqueeze(1)
-        t_next_states = torch.tensor(np.array(next_states), dtype=torch.float32, device=self.device)
-        t_dones = torch.tensor(dones, dtype=torch.float32, device=self.device).unsqueeze(1)
-        t_next_masks = torch.tensor(np.array(next_masks), dtype=torch.float32, device=self.device)
+        if len(batch[0]) == 7:
+            # New 7-tuple: (feat_window, ctx, action, reward, next_feat, next_ctx, done)
+            feat_windows  = np.array([b[0] for b in batch], dtype=np.float32)
+            states        = np.array([b[1] for b in batch], dtype=np.float32)
+            actions       = np.array([b[2] for b in batch], dtype=np.int64)
+            rewards       = np.array([b[3] for b in batch], dtype=np.float32)
+            next_feat     = np.array([b[4] for b in batch], dtype=np.float32)
+            next_states   = np.array([b[5] for b in batch], dtype=np.float32)
+            dones_arr     = np.array([float(b[6]) for b in batch], dtype=np.float32)
+        else:
+            # Legacy 6-tuple: (state, action, reward, next_state, done, next_action_mask)
+            states, actions, rewards, next_states, dones_raw, _ = zip(*batch)
+            states      = np.array(states, dtype=np.float32)
+            actions     = np.array(actions, dtype=np.int64)
+            rewards     = np.array(rewards, dtype=np.float32)
+            next_states = np.array(next_states, dtype=np.float32)
+            dones_arr   = np.array([float(d) for d in dones_raw], dtype=np.float32)
+            nf = max(self.num_features, 1)
+            feat_windows = np.zeros((batch_size, self.policy_net.q_lookback, nf), dtype=np.float32)
+            next_feat    = np.zeros_like(feat_windows)
 
-        # Current Q-values with auxiliary outputs
-        q_eval, aux1_eval, aux2_eval = self.policy_net(t_states, return_aux=True)
-        q_eval_sel = q_eval.gather(1, t_actions)
-        aux1_sel = aux1_eval.gather(1, t_actions)
-        aux2_sel = aux2_eval.gather(1, t_actions)
+        t_feat    = torch.tensor(feat_windows, dtype=torch.float32, device=self.device)
+        t_states  = torch.tensor(states,       dtype=torch.float32, device=self.device)
+        t_actions = torch.tensor(actions,      dtype=torch.int64,   device=self.device).unsqueeze(1)
+        t_rewards = torch.tensor(rewards,      dtype=torch.float32, device=self.device).unsqueeze(1)
+        t_nfeat   = torch.tensor(next_feat,    dtype=torch.float32, device=self.device)
+        t_nstates = torch.tensor(next_states,  dtype=torch.float32, device=self.device)
+        t_dones   = torch.tensor(dones_arr,    dtype=torch.float32, device=self.device).unsqueeze(1)
 
-        # Double Q-Learning target calculation with Action Masking
+        # Use horizon 0 for simplified single-horizon training step
+        q_vals  = self.policy_net(t_feat, t_states, horizon_idx=0)   # (B, 3)
+        q_taken = q_vals.gather(1, t_actions)
+
         with torch.no_grad():
-            next_q_policy = self.policy_net(t_next_states)
-            # Mask invalid actions
-            masked_next_q = torch.where(t_next_masks == 1, next_q_policy, torch.tensor(-1e9, device=self.device))
-            best_next_actions = masked_next_q.argmax(dim=1, keepdim=True)
+            next_q      = self.target_net(t_nfeat, t_nstates, horizon_idx=0)
+            best_next_q = next_q.max(dim=1, keepdim=True).values
+            q_target    = t_rewards + (1.0 - t_dones) * self.gamma * best_next_q
 
-            next_q_target = self.target_net(t_next_states).gather(1, best_next_actions)
-            q_target = t_rewards + (1.0 - t_dones) * self.gamma * next_q_target
-
-        smooth_l1 = nn.SmoothL1Loss()
-        main_loss = smooth_l1(q_eval_sel, q_target)
-        aux1_loss = smooth_l1(aux1_sel, q_target)
-        aux2_loss = smooth_l1(aux2_sel, q_target)
-
-        total_loss = main_loss + 0.2 * aux1_loss + 0.2 * aux2_loss
-
+        loss = nn.SmoothL1Loss()(q_taken, q_target)
         self.optimizer.zero_grad()
-        total_loss.backward()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
         self.optimizer.step()
 
-        # Decay epsilon
-        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-        return float(total_loss.item())
+        # --- Regret buffer (Track B): 20% sampling rate ---
+        regret_min = max(1, batch_size // 5)
+        if len(self.regret_buffer) >= regret_min and random.random() < 0.20:
+            regret_sample = random.sample(list(self.regret_buffer), regret_min)
+            r_feat    = torch.tensor(np.array([r.feat_window for r in regret_sample]),
+                                     dtype=torch.float32, device=self.device)
+            r_ctx     = torch.tensor(np.array([r.ctx_state for r in regret_sample]),
+                                     dtype=torch.float32, device=self.device)
+            r_nfeat   = torch.tensor(np.array([r.next_feat_window for r in regret_sample]),
+                                     dtype=torch.float32, device=self.device)
+            r_nctx    = torch.tensor(np.array([r.next_ctx_state for r in regret_sample]),
+                                     dtype=torch.float32, device=self.device)
+            r_rewards = torch.tensor([r.regret_reward for r in regret_sample],
+                                     dtype=torch.float32, device=self.device).unsqueeze(1)
+            r_hidx    = regret_sample[0].horizon_idx   # train each sample on its horizon
 
+            r_q_vals  = self.policy_net(r_feat, r_ctx, horizon_idx=r_hidx)  # (B, 3)
+            r_wait    = torch.zeros(regret_min, 1, dtype=torch.int64, device=self.device)  # always WAIT
+            r_q_taken = r_q_vals.gather(1, r_wait)
+
+            with torch.no_grad():
+                r_next_q     = self.target_net(r_nfeat, r_nctx, horizon_idx=r_hidx)
+                r_best_next  = r_next_q.max(dim=1, keepdim=True).values
+                r_q_target   = r_rewards + self.gamma * r_best_next   # no done flag — always terminal
+
+            r_loss = nn.SmoothL1Loss()(r_q_taken, r_q_target)
+            self.optimizer.zero_grad()
+            r_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+            self.optimizer.step()
+
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        return float(loss.item())
 
     def update_target_network(self) -> None:
         """Sync target network weights."""
@@ -487,4 +677,3 @@ class OptionsQExecutor:
                 reward += 0.02
 
         return float(np.clip(reward, -3.0, 3.0))
-

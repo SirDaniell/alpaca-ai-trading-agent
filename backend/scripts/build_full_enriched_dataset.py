@@ -3,6 +3,8 @@
 build_full_enriched_dataset.py — Comprehensive Multi-Timeframe Data Enrichment Pipeline.
 
 Enriches multi-timeframe market data for AXE Genesis Meta-Learner & Q-Learner:
+
+FEATURE ENRICHMENT:
 - Fetches and enriches raw candles across every timeframe (5m, 15m, 1h, 4h, 1d).
 - Constructs Synthetic DXY OHLCV candles for every timeframe (5m, 15m, 1h, 4h, 1d).
 - Calculates MTF RSI for both Main Symbol and DXY across all timeframes (rsi_<tf>, dxy_rsi_<tf>, rsi_diff_<tf>).
@@ -11,12 +13,42 @@ Enriches multi-timeframe market data for AXE Genesis Meta-Learner & Q-Learner:
     * DXY Symbol: dxy_snr_dist_supp_<tf>, dxy_snr_dist_res_<tf>
 - Runs full 200+ Technical Indicators engine on primary 5m timeframe data.
 - Strict no-lookahead MTF alignment (+1 HTF interval shift).
-- Multi-horizon directional target labels (target_dir_5m, target_dir_15m, target_dir_30m, target_dir_1h).
-- Chronological 70% Train / 15% Val / 15% Test partitioning.
+
+TARGET LABELS (37 total for Meta-Learner training):
+  
+  TIER 1 — CORE PREDICTION TARGETS (21 targets) ✅ CRITICAL:
+    Directional (4):          target_dir_5m, target_dir_15m, target_dir_30m, target_dir_1h
+    Strength (4):             forward_strength_5m, forward_strength_15m, forward_strength_30m, forward_strength_1h
+    Price Movement (4):        forward_move_1, forward_move_3, forward_move_6, forward_move_12
+    Risk/MFE-MAE (8):          mfe_1, mae_1, mfe_3, mae_3, mfe_6, mae_6, mfe_12, mae_12
+    Reversal (1):              reversal_prob_1h
+
+  TIER 2 — ZONE SEQUENCING (5 targets) ⚠️ CRITICAL FOR Q-LEARNER:
+    Next Zone:                adv_target_next_zone_idx, adv_target_next_zone_bars
+    Zone Distance:            adv_target_next_zone_distance, adv_target_next_zone_volume
+    Zone Volume:              zone_next_volume_ratio
+
+  TIER 3 — VOLATILITY & REGIME (10 targets) 📊 HIGH VALUE:
+    Volatility Regime (6):    Volatility_Regime_next, vol_regime_fwd_8, Volatility_Expansion_next, vol_expansion_fwd_8, 
+                              Volatility_Bull_next, Volatility_Bear_next
+    Regime Speed (6):         Regime_Speed_Bull_next, Regime_Speed_Bear_next, Regime_Speed_Aligned_next, Regime_Speed_Divergence_next,
+                              speed_aligned_fwd_8, speed_divergence_fwd_8
+
+  TIER 4 — PRICE VELOCITY (6 targets) 🚀 MEDIUM VALUE:
+    Velocity Targets (6):     Price_Velocity_Bull_next, vel_bull_fwd_8, Price_Velocity_Bear_next, vel_bear_fwd_8,
+                              Price_Velocity_Net_next, vel_net_fwd_8
+
+  TIER 5 — OPTIONAL MULTI-TASK (4 targets) 📈 NICE-TO-HAVE:
+    Currency Divergence (4):  adv_target_CSM_hist_fast_next, adv_target_CSM_hist_slow_next, 
+                              adv_target_CSM_asset_fast_next, adv_target_CSM_dxy_fast_next
+
+- Chronological 70% Train / 15% Val / 15% Test partitioning (context windows: 150-bar meta, 300-bar Q).
 - Scaler fitting EXCLUSIVELY on 70% Train set.
 - Compressed zip export to data/axe_meta_dataset.zip.
+- Supports --limit (default 50000) and --symbol CLI args.
 """
 
+import argparse
 import os
 import sys
 import logging
@@ -37,6 +69,7 @@ from app.core.ml.real_data_pipeline import (
 from app.core.analysis.technical_indicators import TechnicalIndicators, IndicatorConfig
 from app.core.ml.ti_meta_features import TI_NUMERIC_FEATURE_KEYS, CONTEXT_FEATURE_KEYS
 from app.core.ml.signal_meta_learner import FeatureScaler
+from app.core.ml.ml_dataset_preparation import MLDatasetPreparation, DatasetConfig
 
 
 def _calculate_rsi(series: pd.Series, window: int = 14) -> pd.Series:
@@ -48,7 +81,69 @@ def _calculate_rsi(series: pd.Series, window: int = 14) -> pd.Series:
     return (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
 
 
-def build_and_enrich_mtf_dataset(symbol: str = "GLD", limit: int = 40000):
+def _compute_ml_targets(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute all 21+ advanced ML targets using MLDatasetPreparator.
+    
+    Targets added:
+    - Zone Liquidity (5): next_zone_idx, bars, distance, volume, + confluence
+    - Volatility Regime (10): Volatility_Regime_next, vol_regime_fwd_8, Volatility_Expansion_next,
+                             vol_expansion_fwd_8, Volatility_Bull_next, Volatility_Bear_next,
+                             Regime_Speed_Bull_next, Regime_Speed_Bear_next, speed_aligned_fwd_8,
+                             speed_divergence_fwd_8
+    - Price Velocity (6): Price_Velocity_Bull_next, vel_bull_fwd_8, Price_Velocity_Bear_next,
+                         vel_bear_fwd_8, Price_Velocity_Net_next, vel_net_fwd_8
+    - Currency Divergence (4, optional): CSM targets
+    
+    Returns: DataFrame with all targets added
+    """
+    try:
+        logger.info("[MLTargets] Initializing MLDatasetPreparation for advanced target computation...")
+        prep = MLDatasetPreparation(df.copy(), config=DatasetConfig())
+        
+        # Zone Liquidity Targets (5 targets)
+        logger.info("[MLTargets] Computing zone liquidity targets...")
+        zone_cols = prep._compute_next_zone_targets(n_future=20, zone_touch_pct=0.004)
+        logger.info(f"[MLTargets] ✅ Added {len(zone_cols)} zone targets: {zone_cols}")
+        
+        # Volatility Regime + Expansion Targets (6 targets)
+        logger.info("[MLTargets] Computing volatility regime targets...")
+        vol_cols = prep._compute_forward_volatility_targets(n_future=8, decay=0.85)
+        logger.info(f"[MLTargets] ✅ Added {len(vol_cols)} volatility targets: {vol_cols}")
+        
+        # Regime Speed Targets (6 targets)
+        logger.info("[MLTargets] Computing regime speed targets...")
+        speed_cols = prep._compute_forward_regime_speed_targets(n_future=8, decay=0.85)
+        logger.info(f"[MLTargets] ✅ Added {len(speed_cols)} regime speed targets: {speed_cols}")
+        
+        # Price Velocity Targets (6 targets)
+        logger.info("[MLTargets] Computing price velocity targets...")
+        vel_cols = prep._compute_forward_velocity_targets(n_future=8, decay=0.85)
+        logger.info(f"[MLTargets] ✅ Added {len(vel_cols)} velocity targets: {vel_cols}")
+        
+        # Currency Divergence Targets (4 targets, optional)
+        logger.info("[MLTargets] Computing currency divergence (CSM) targets...")
+        csm_cols = prep._compute_forward_csm_targets()
+        if csm_cols:
+            logger.info(f"[MLTargets] ✅ Added {len(csm_cols)} CSM targets: {csm_cols}")
+        else:
+            logger.info("[MLTargets] ℹ No CSM columns available (optional)")
+        
+        # Get the enriched DataFrame from the preparator
+        df_enriched = prep.data
+        
+        total_added = len(zone_cols) + len(vol_cols) + len(speed_cols) + len(vel_cols) + len(csm_cols)
+        logger.info(f"[MLTargets] ✅ COMPLETE! Added {total_added} advanced ML targets")
+        
+        return df_enriched
+        
+    except Exception as e:
+        logger.warning(f"[MLTargets] ⚠️  Error during ML target computation: {e}. Continuing without advanced targets.")
+        return df
+
+
+def build_and_enrich_mtf_dataset(symbol: str = "GLD", limit: int = 50_000):
+    k_label = f"{limit // 1000}k"
     logger.info("==================================================================================")
     logger.info("  AXE GENESIS COMPREHENSIVE MULTI-TIMEFRAME ENRICHMENT: SYMBOL %s", symbol)
     logger.info("==================================================================================")
@@ -66,7 +161,8 @@ def build_and_enrich_mtf_dataset(symbol: str = "GLD", limit: int = 40000):
     tf_raw_dfs: dict[str, pd.DataFrame] = {"5m": ltf_df}
 
     for tf in ["15m", "1h", "4h", "1d"]:
-        start_str = _htf_start_for(ltf_anchor, tf, lookback_bars=1000)
+        # HTF lookback: 300 bars matches Q_LOOKBACK (zone lifecycle window)
+        start_str = _htf_start_for(ltf_anchor, tf, lookback_bars=300)
         df_htf = fetch_real_candles(symbol, timeframe=tf, limit=limit, start=start_str)
         if df_htf is not None and not df_htf.empty:
             tf_raw_dfs[tf] = df_htf
@@ -222,8 +318,16 @@ def build_and_enrich_mtf_dataset(symbol: str = "GLD", limit: int = 40000):
 
     aligned.dropna(subset=["forward_move_12"], inplace=True)
 
+    # ── 5.5. Compute Advanced ML Targets (21+ targets for Meta-Learner multi-head training) ──
+    logger.info("📌 Step 5.5/6: Computing 21+ advanced ML targets (zone liquidity, volatility, velocity)...")
+    cols_before = len(aligned.columns)
+    aligned = _compute_ml_targets(aligned)
+    cols_after = len(aligned.columns)
+    logger.info(f"  ✓ ML targets complete: +{cols_after - cols_before} columns added | Total: {cols_after} columns")
+
     # 6. Chronological 70/15/15 Partitioning & Train-Only Scaler Fitting
     logger.info("📌 Step 6/6: Partitioning 70/15/15 splits & fitting FeatureScaler EXCLUSIVELY on Train split...")
+
     n_total = len(aligned)
     train_idx = int(n_total * 0.70)
     val_idx = int(n_total * 0.85)
@@ -255,10 +359,10 @@ def build_and_enrich_mtf_dataset(symbol: str = "GLD", limit: int = 40000):
 
     # Export & Zip
     os.makedirs("data", exist_ok=True)
-    csv_train_path = "data/train_40k.csv"
-    csv_val_path   = "data/val_40k.csv"
-    csv_test_path  = "data/test_40k.csv"
-    csv_full_path  = "data/full_40k.csv"
+    csv_train_path = f"data/train_{k_label}.csv"
+    csv_val_path   = f"data/val_{k_label}.csv"
+    csv_test_path  = f"data/test_{k_label}.csv"
+    csv_full_path  = f"data/full_{k_label}.csv"
     zip_export_path = "data/axe_meta_dataset.zip"
 
     train_df.to_csv(csv_train_path, index=False)
@@ -267,14 +371,19 @@ def build_and_enrich_mtf_dataset(symbol: str = "GLD", limit: int = 40000):
     aligned.to_csv(csv_full_path, index=False)
 
     with zipfile.ZipFile(zip_export_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        zipf.write(csv_train_path, arcname="train_40k.csv")
-        zipf.write(csv_val_path,   arcname="val_40k.csv")
-        zipf.write(csv_test_path,  arcname="test_40k.csv")
-        zipf.write(csv_full_path,  arcname="full_40k.csv")
+        zipf.write(csv_train_path, arcname=f"train_{k_label}.csv")
+        zipf.write(csv_val_path,   arcname=f"val_{k_label}.csv")
+        zipf.write(csv_test_path,  arcname=f"test_{k_label}.csv")
+        zipf.write(csv_full_path,  arcname=f"full_{k_label}.csv")
 
     zip_mb = os.path.getsize(zip_export_path) / (1024 * 1024)
     logger.info("📦 Exported & zipped multi-timeframe dataset to %s (%.2f MB)", zip_export_path, zip_mb)
 
 
 if __name__ == "__main__":
-    build_and_enrich_mtf_dataset()
+    parser = argparse.ArgumentParser(description="Build enriched MTF dataset for Kaggle training.")
+    parser.add_argument("--symbol", default="GLD", help="Trading symbol to fetch (default: GLD)")
+    parser.add_argument("--limit",  type=int, default=50_000,
+                        help="Number of 5m bars to fetch (default: 50000 → ~50k dataset)")
+    args = parser.parse_args()
+    build_and_enrich_mtf_dataset(symbol=args.symbol, limit=args.limit)

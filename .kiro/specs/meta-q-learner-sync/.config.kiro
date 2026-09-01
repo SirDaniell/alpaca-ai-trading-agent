@@ -1,0 +1,31 @@
+[spec]
+name = "Meta-Learner + Q-Learner Architecture Sync & Verification"
+phase = "investigation"
+status = "IN PROGRESS"
+priority = "critical"
+date_started = "2026-09-01"
+
+[investigation]
+focus = [
+  "Dataset context window strategy (1k for Q-learner zone analysis vs 150 for meta-learner)",
+  "Target inventory mastery (30+ advanced targets in ml_dataset_preparation.py)",
+  "Meta-learner head isolation & connectivity (stochastic depth via StopGradient)",
+  "Q-learner integration with meta-learner outputs",
+  "Parity between notebook (PyTorch) and app code (TensorFlow Keras)",
+  "Data leakage prevention in both codebases"
+]
+
+[key_questions]
+q1 = "Are all 30+ targets from ml_dataset_preparation.py being consumed by the meta-learner heads?"
+q2 = "Is the 1k-bar context window being used correctly for zone analysis vs 150-bar for per-head predictions?"
+q3 = "Are the meta-learner heads properly isolated (no gradient contamination)?"
+q4 = "How does the Q-learner consume meta-learner outputs for decision-making?"
+q5 = "What is the expected edge in each horizon (5m/15m/30m/1h)?"
+q6 = "Are there data leakage issues in the dataset collection pipeline?"
+
+[next_phases]
+phase_1 = "Investigation Report (targets, connectivity, gaps)"
+phase_2 = "Architecture Design (heads, context windows, isolation)"
+phase_3 = "Dataset Flow Specification (train/val/test, target routing)"
+phase_4 = "Notebook <-> App Code Sync (PyTorch vs Keras parity)"
+phase_5 = "Implementation (if fixes needed)"
