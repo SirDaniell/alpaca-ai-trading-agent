@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 675" width="1200" height="675" style="background:#0b0e14; font-family: system-ui, -apple-system, sans-serif;">
+  <rect width="1200" height="675" fill="#0b0e14"/>
+  <text x="600" y="70" text-anchor="middle" fill="#ffffff" font-size="32" font-weight="700">MODEL 2: PRIORITIZED REPLAY DIARY</text>
+  <text x="600" y="105" text-anchor="middle" fill="#ffd700" font-size="18" font-weight="500">Memory Buffer Stores 50,000 Experiences Per Horizon Head</text>
+
+  <rect x="80" y="140" width="1040" height="480" rx="20" fill="#111622" stroke="#ffd700" stroke-opacity="0.5" stroke-width="2"/>
+
+  <text x="120" y="195" fill="#ffd700" font-size="22" font-weight="700">📖 Replay Memory Buffer Tuple (State, Action, Reward, Next State)</text>
+
+  <!-- Experience Cards -->
+  <rect x="120" y="225" width="960" height="80" rx="10" fill="#1a2234" stroke="#2a3650"/>
+  <text x="150" y="260" fill="#00f0ff" font-size="16" font-weight="600">Experience #48,291 (15m Head)</text>
+  <text x="150" y="285" fill="#94a3b8" font-size="14">State: S/R Dist=0.004, RSI=64 | Action: BUY CALL | Reward: +1.0 (WIN) | Next State: Expiry +3 bars</text>
+
+  <rect x="120" y="320" width="960" height="80" rx="10" fill="#1a2234" stroke="#2a3650"/>
+  <text x="150" y="355" fill="#ff4d4d" font-size="16" font-weight="600">Experience #48,292 (5m Head)</text>
+  <text x="150" y="380" fill="#94a3b8" font-size="14">State: S/R Dist=0.001, RSI=48 | Action: BUY PUT  | Reward: -1.0 (LOSS) | Next State: Expiry +1 bar</text>
+
+  <rect x="120" y="415" width="960" height="80" rx="10" fill="#1a2234" stroke="#2a3650"/>
+  <text x="150" y="450" fill="#00ff9d" font-size="16" font-weight="600">Experience #48,293 (30m Head)</text>
+  <text x="150" y="475" fill="#94a3b8" font-size="14">State: S/R Dist=0.008, RSI=52 | Action: WAIT     | Reward:  0.0 (SAFE) | Next State: Expiry +6 bars</text>
+
+  <text x="600" y="560" text-anchor="middle" fill="#ffffff" font-size="18" font-weight="600">Off-Policy Training: Shuffles past memory pages so the agent learns from long-term history.</text>
+</svg>

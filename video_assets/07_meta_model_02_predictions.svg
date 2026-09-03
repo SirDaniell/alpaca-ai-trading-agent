@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 675" width="1200" height="675" style="background:#0b0e14; font-family: system-ui, -apple-system, sans-serif;">
+  <rect width="1200" height="675" fill="#0b0e14"/>
+  <text x="600" y="70" text-anchor="middle" fill="#ffffff" font-size="32" font-weight="700">MODEL 1: META-LEARNER (OUTPUT PREDICTIONS)</text>
+  <text x="600" y="105" text-anchor="middle" fill="#00ff9d" font-size="18" font-weight="500">What It Predicts: Setup Quality &amp; Multi-Horizon Conviction</text>
+
+  <rect x="80" y="140" width="1040" height="480" rx="20" fill="#111622" stroke="#00ff9d" stroke-opacity="0.4" stroke-width="2"/>
+
+  <!-- Gauge 1: Signal Strength -->
+  <rect x="120" y="180" width="460" height="180" rx="12" fill="#1a2234" stroke="#2a3650" stroke-width="2"/>
+  <text x="150" y="225" fill="#ffffff" font-size="22" font-weight="600">Signal Strength Score</text>
+  <text x="150" y="270" fill="#00ff9d" font-size="36" font-weight="800">0.84 / 1.00</text>
+  <rect x="150" y="295" width="400" height="16" rx="8" fill="#0f172a"/>
+  <rect x="150" y="295" width="336" height="16" rx="8" fill="#00ff9d"/>
+  <text x="150" y="335" fill="#94a3b8" font-size="14">Continuous MSE Quality Score (High Conviction)</text>
+
+  <!-- Gauge 2: Reversal & MFE/MAE -->
+  <rect x="620" y="180" width="460" height="180" rx="12" fill="#1a2234" stroke="#2a3650" stroke-width="2"/>
+  <text x="650" y="225" fill="#ffffff" font-size="22" font-weight="600">Reversal Risk &amp; Excursions</text>
+  <text x="650" y="265" fill="#ffd700" font-size="18" font-weight="600">Reversal Prob: 18% (Low Risk)</text>
+  <text x="650" y="295" fill="#00f0ff" font-size="18" font-weight="600">Expected MFE: +52 Pips</text>
+  <text x="650" y="325" fill="#ff4d4d" font-size="18" font-weight="600">Expected MAE: -14 Pips</text>
+
+  <!-- 4 Horizon Conviction Scores -->
+  <rect x="120" y="380" width="960" height="200" rx="12" fill="#1a2234" stroke="#2a3650" stroke-width="2"/>
+  <text x="150" y="420" fill="#ffffff" font-size="22" font-weight="600">Per-Horizon Conviction Scores</text>
+  
+  <text x="180" y="465" fill="#94a3b8" font-size="16">5m Expiry (1 bar):</text>
+  <rect x="360" y="450" width="680" height="14" rx="7" fill="#0f172a"/>
+  <rect x="360" y="450" width="374" height="14" rx="7" fill="#3b82f6"/>
+  <text x="750" y="465" fill="#3b82f6" font-size="15" font-weight="700">55%</text>
+
+  <text x="180" y="495" fill="#94a3b8" font-size="16">15m Expiry (3 bars):</text>
+  <rect x="360" y="480" width="680" height="14" rx="7" fill="#0f172a"/>
+  <rect x="360" y="480" width="571" height="14" rx="7" fill="#00ff9d"/>
+  <text x="950" y="495" fill="#00ff9d" font-size="15" font-weight="700">84% ⭐ RECOMMENDED</text>
+
+  <text x="180" y="525" fill="#94a3b8" font-size="16">30m Expiry (6 bars):</text>
+  <rect x="360" y="510" width="680" height="14" rx="7" fill="#0f172a"/>
+  <rect x="360" y="510" width="482" height="14" rx="7" fill="#ffd700"/>
+  <text x="860" y="525" fill="#ffd700" font-size="15" font-weight="700">71%</text>
+
+  <text x="180" y="555" fill="#94a3b8" font-size="16">1h Expiry (12 bars):</text>
+  <rect x="360" y="540" width="680" height="14" rx="7" fill="#0f172a"/>
+  <rect x="360" y="540" width="408" height="14" rx="7" fill="#a855f7"/>
+  <text x="780" y="555" fill="#a855f7" font-size="15" font-weight="700">60%</text>
+</svg>

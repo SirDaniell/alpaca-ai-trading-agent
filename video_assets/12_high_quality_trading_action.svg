@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" width="1920" height="1080" style="background:#0b0e14; font-family: system-ui, -apple-system, sans-serif;">
+  <rect width="1920" height="1080" fill="#0b0e14"/>
+  <defs>
+    <linearGradient id="gridGlow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#00f0ff" stop-opacity="0.1"/>
+      <stop offset="100%" stop-color="#0b0e14" stop-opacity="0.9"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Top Header Bar -->
+  <rect x="0" y="0" width="1920" height="50" fill="#141923" stroke="#1f293d" stroke-width="1"/>
+  <text x="30" y="32" fill="#ffd700" font-size="20" font-weight="700">GOLD (XAU/USD)</text>
+  <text x="200" y="32" fill="#00ff9d" font-size="16" font-weight="600">$1,854.40 +1.42%</text>
+  <text x="380" y="32" fill="#00f0ff" font-size="14" font-weight="500">H1 TIMEFRAME | LIVE ALGORITHMIC TRADING ACTION</text>
+  <rect x="1700" y="10" width="190" height="30" rx="6" fill="#00ff9d" fill-opacity="0.2"/>
+  <text x="1795" y="30" text-anchor="middle" fill="#00ff9d" font-size="13" font-weight="700">AXE PAKA ACTIVE</text>
+
+  <!-- Main Chart Grid -->
+  <line x1="100" y1="120" x2="1820" y2="120" stroke="#1e293b" stroke-width="1" stroke-dasharray="4"/>
+  <line x1="100" y1="240" x2="1820" y2="240" stroke="#1e293b" stroke-width="1" stroke-dasharray="4"/>
+  <line x1="100" y1="360" x2="1820" y2="360" stroke="#1e293b" stroke-width="1" stroke-dasharray="4"/>
+  <line x1="100" y1="480" x2="1820" y2="480" stroke="#1e293b" stroke-width="1" stroke-dasharray="4"/>
+
+  <!-- Support & Resistance Lines -->
+  <line x1="100" y1="180" x2="1820" y2="180" stroke="#ff4d4d" stroke-dasharray="6" stroke-width="2"/>
+  <text x="1830" y="185" fill="#ff4d4d" font-size="12" font-weight="700">RESISTANCE $1,868.50</text>
+
+  <line x1="100" y1="440" x2="1820" y2="440" stroke="#00f0ff" stroke-dasharray="6" stroke-width="2"/>
+  <text x="1830" y="445" fill="#00f0ff" font-size="12" font-weight="700">SUPPORT $1,842.10</text>
+
+  <!-- Candlesticks Sequence -->
+  <!-- Candle 1 (Green) -->
+  <line x1="200" y1="380" x2="200" y2="480" stroke="#00ff9d" stroke-width="2"/>
+  <rect x="190" y="400" width="20" height="60" fill="#00ff9d"/>
+
+  <!-- Candle 2 (Green) -->
+  <line x1="280" y1="340" x2="280" y2="430" stroke="#00ff9d" stroke-width="2"/>
+  <rect x="270" y="360" width="20" height="50" fill="#00ff9d"/>
+
+  <!-- Signal Arrow UP 1 -->
+  <line x1="280" y1="480" x2="280" y2="450" stroke="#00ff9d" stroke-width="4"/>
+  <polygon points="280,440 270,455 290,455" fill="#00ff9d"/>
+  <rect x="180" y="495" width="200" height="24" rx="4" fill="#00ff9d" fill-opacity="0.2"/>
+  <text x="280" y="512" text-anchor="middle" fill="#00ff9d" font-size="12" font-weight="700">H1 RSI Bull x MA [64% | +0p]</text>
+
+  <!-- Candle 3 (Red) -->
+  <line x1="360" y1="350" x2="360" y2="420" stroke="#ff4d4d" stroke-width="2"/>
+  <rect x="350" y="370" width="20" height="40" fill="#ff4d4d"/>
+
+  <!-- Candle 4 (Green Breakout) -->
+  <line x1="440" y1="280" x2="440" y2="400" stroke="#00ff9d" stroke-width="2"/>
+  <rect x="430" y="300" width="20" height="80" fill="#00ff9d"/>
+
+  <!-- Candle 5 (Green Strong) -->
+  <line x1="520" y1="210" x2="520" y2="320" stroke="#00ff9d" stroke-width="2"/>
+  <rect x="510" y="230" width="20" height="80" fill="#00ff9d"/>
+
+  <!-- Signal Arrow UP 2 -->
+  <polygon points="520,330 510,345 530,345" fill="#00ff9d"/>
+  <rect x="440" y="355" width="160" height="24" rx="4" fill="#00ff9d" fill-opacity="0.2"/>
+  <text x="520" y="372" text-anchor="middle" fill="#00ff9d" font-size="12" font-weight="700">Index RSI x DXY RSI</text>
+
+  <!-- Candle 6 (Red Top) -->
+  <line x1="600" y1="160" x2="600" y2="260" stroke="#ff4d4d" stroke-width="2"/>
+  <rect x="590" y="180" width="20" height="60" fill="#ff4d4d"/>
+
+  <!-- Signal Arrow DOWN 1 -->
+  <polygon points="600,165 590,150 610,150" fill="#ff4d4d"/>
+  <rect x="520" y="120" width="160" height="24" rx="4" fill="#ff4d4d" fill-opacity="0.2"/>
+  <text x="600" y="137" text-anchor="middle" fill="#ff4d4d" font-size="12" font-weight="700">H1 RSI Bear x MA [63%]</text>
+
+  <!-- Candle 7 (Red Drop) -->
+  <line x1="680" y1="220" x2="680" y2="340" stroke="#ff4d4d" stroke-width="2"/>
+  <rect x="670" y="240" width="20" height="80" fill="#ff4d4d"/>
+
+  <!-- Candle 8 (Green Rebound) -->
+  <line x1="760" y1="290" x2="760" y2="370" stroke="#00ff9d" stroke-width="2"/>
+  <rect x="750" y="310" width="20" height="50" fill="#00ff9d"/>
+
+  <!-- Moving Averages -->
+  <path d="M 100 450 Q 350 420 600 210 T 800 350" fill="none" stroke="#ffd700" stroke-width="3"/>
+  <path d="M 100 470 Q 350 440 600 250 T 800 380" fill="none" stroke="#00f0ff" stroke-width="2"/>
+
+  <!-- Execution Badge Overlay -->
+  <rect x="850" y="220" width="480" height="130" rx="12" fill="#111c17" stroke="#00ff9d" stroke-width="2"/>
+  <text x="880" y="255" fill="#00ff9d" font-size="20" font-weight="700">⚡ AXE PAKA LIVE EXECUTION</text>
+  <text x="880" y="285" fill="#ffffff" font-size="16" font-weight="600">Selected Expiry: 15m Horizon | Action: BUY CALL</text>
+  <text x="880" y="310" fill="#00f0ff" font-size="14" font-weight="500">Meta Quality Score: 0.84 (High Conviction)</text>
+  <text x="880" y="330" fill="#ffd700" font-size="14" font-weight="500">Hard Action Mask Gate: PASSED (No Risk Proximity)</text>
+
+  <!-- Subchart: Multi-Timeframe RSI -->
+  <rect x="100" y="580" width="1720" height="420" rx="12" fill="#111622" stroke="#1e293b" stroke-width="2"/>
+  <text x="130" y="615" fill="#ffffff" font-size="16" font-weight="600">MULTI-TIMEFRAME RSI &amp; DXY SPREAD HISTOGRAM</text>
+
+  <line x1="100" y1="780" x2="1820" y2="780" stroke="#334155" stroke-dasharray="4"/>
+  <text x="1830" y="785" fill="#94a3b8" font-size="12">50.0 (NEUTRAL)</text>
+
+  <line x1="100" y1="660" x2="1820" y2="660" stroke="#ff4d4d" stroke-dasharray="2" opacity="0.5"/>
+  <text x="1830" y="665" fill="#ff4d4d" font-size="12">70.0 (OVERBOUGHT)</text>
+
+  <line x1="100" y1="900" x2="1820" y2="900" stroke="#00ff9d" stroke-dasharray="2" opacity="0.5"/>
+  <text x="1830" y="905" fill="#00ff9d" font-size="12">30.0 (OVERSOLD)</text>
+
+  <!-- RSI Indicator Curves -->
+  <path d="M 100 850 Q 350 890 600 640 T 900 750 T 1300 680 T 1800 820" fill="none" stroke="#00f0ff" stroke-width="3"/>
+  <path d="M 100 820 Q 350 860 600 670 T 900 780 T 1300 710 T 1800 790" fill="none" stroke="#ffd700" stroke-width="2"/>
+  <path d="M 100 880 Q 350 910 600 620 T 900 730 T 1300 650 T 1800 850" fill="none" stroke="#ff4d4d" stroke-width="2"/>
+</svg>

@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 675" width="1200" height="675" style="background:#0b0e14; font-family: system-ui, -apple-system, sans-serif;">
+  <rect width="1200" height="675" fill="#0b0e14"/>
+  <text x="600" y="70" text-anchor="middle" fill="#ffffff" font-size="32" font-weight="700">MODEL 1: SIGNAL ALIGNMENT VS NOISE</text>
+  <text x="600" y="105" text-anchor="middle" fill="#ffd700" font-size="18" font-weight="500">Why It Matters: Discarding Weak Trades &amp; Rewarding Confluence</text>
+
+  <!-- Left Side: Noise -->
+  <rect x="80" y="140" width="490" height="480" rx="20" fill="#161218" stroke="#ff4d4d" stroke-opacity="0.5" stroke-width="2"/>
+  <text x="325" y="190" text-anchor="middle" fill="#ff4d4d" font-size="24" font-weight="700">❌ MARKET NOISE (SKIP)</text>
+  <text x="325" y="230" text-anchor="middle" fill="#94a3b8" font-size="16">Conflicting / Weak Signals</text>
+  
+  <rect x="120" y="270" width="410" height="60" rx="10" fill="#24141a"/>
+  <text x="140" y="305" fill="#ff4d4d" font-size="16" font-weight="600">RSI Bullish vs DXY Bearish (Fought)</text>
+  
+  <rect x="120" y="350" width="410" height="60" rx="10" fill="#24141a"/>
+  <text x="140" y="385" fill="#ff4d4d" font-size="16" font-weight="600">Price in Middle of Nowhere (No Zone)</text>
+
+  <rect x="120" y="430" width="410" height="60" rx="10" fill="#24141a"/>
+  <text x="140" y="465" fill="#ff4d4d" font-size="16" font-weight="600">Meta Strength &lt; 0.50 (Filtered Out)</text>
+
+  <text x="325" y="560" text-anchor="middle" fill="#ff4d4d" font-size="22" font-weight="800">RESULT: NO TRADE ENTERED</text>
+
+  <!-- Right Side: Confluence -->
+  <rect x="630" y="140" width="490" height="480" rx="20" fill="#101c18" stroke="#00ff9d" stroke-opacity="0.5" stroke-width="2"/>
+  <text x="875" y="190" text-anchor="middle" fill="#00ff9d" font-size="24" font-weight="700">✅ SIGNAL CONFLUENCE</text>
+  <text x="875" y="230" text-anchor="middle" fill="#94a3b8" font-size="16">Aligned Multi-Indicator Setup</text>
+
+  <rect x="670" y="270" width="410" height="60" rx="10" fill="#142c22"/>
+  <text x="690" y="305" fill="#00ff9d" font-size="16" font-weight="600">RSI Bull Cross + DXY Divergence</text>
+  
+  <rect x="670" y="350" width="410" height="60" rx="10" fill="#142c22"/>
+  <text x="690" y="385" fill="#00ff9d" font-size="16" font-weight="600">Price Bouncing at Support Zone</text>
+
+  <rect x="670" y="430" width="410" height="60" rx="10" fill="#142c22"/>
+  <text x="690" y="465" fill="#00ff9d" font-size="16" font-weight="600">Meta Strength ≥ 0.80 (Quality Bonus)</text>
+
+  <text x="875" y="560" text-anchor="middle" fill="#00ff9d" font-size="22" font-weight="800">RESULT: HIGH CONVICTION TRADE</text>
+</svg>

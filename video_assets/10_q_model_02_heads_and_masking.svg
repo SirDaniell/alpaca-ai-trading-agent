@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 675" width="1200" height="675" style="background:#0b0e14; font-family: system-ui, -apple-system, sans-serif;">
+  <rect width="1200" height="675" fill="#0b0e14"/>
+  <text x="600" y="70" text-anchor="middle" fill="#ffffff" font-size="32" font-weight="700">MODEL 2: ACTION MASKING &amp; Q-HEADS</text>
+  <text x="600" y="105" text-anchor="middle" fill="#00ff9d" font-size="18" font-weight="500">Safety Guardrails Filter Risky Trades Before Execution</text>
+
+  <!-- Hard Action Mask -->
+  <rect x="80" y="140" width="460" height="480" rx="20" fill="#1a1c18" stroke="#00ff9d" stroke-width="2"/>
+  <text x="310" y="190" text-anchor="middle" fill="#00ff9d" font-size="24" font-weight="700">🛡️ HARD ACTION MASK</text>
+  <text x="310" y="225" text-anchor="middle" fill="#94a3b8" font-size="15">Market Constraint Safety Engine</text>
+
+  <rect x="110" y="260" width="400" height="70" rx="10" fill="#13241b"/>
+  <text x="130" y="290" fill="#ffffff" font-size="15" font-weight="600">Rule 1: Open Position Limits</text>
+  <text x="130" y="315" fill="#00ff9d" font-size="14">If position open → FORCE WAIT (No re-entry)</text>
+
+  <rect x="110" y="350" width="400" height="70" rx="10" fill="#13241b"/>
+  <text x="130" y="380" fill="#ffffff" font-size="15" font-weight="600">Rule 2: S/R Proximity Band</text>
+  <text x="130" y="405" fill="#00ff9d" font-size="14">Too close to resistance → BLOCK CALL</text>
+
+  <rect x="110" y="440" width="400" height="70" rx="10" fill="#13241b"/>
+  <text x="130" y="470" fill="#ffffff" font-size="15" font-weight="600">Rule 3: Volume Imbalance</text>
+  <text x="130" y="495" fill="#00ff9d" font-size="14">Sell volume &gt; 3x Buy volume → BLOCK CALL</text>
+
+  <text x="310" y="565" text-anchor="middle" fill="#ffd700" font-size="16" font-weight="600">Masked Actions Set Q-Value to -1e9</text>
+
+  <!-- 4 Q-Heads -->
+  <rect x="580" y="140" width="540" height="480" rx="20" fill="#111622" stroke="#3b82f6" stroke-width="2"/>
+  <text x="850" y="190" text-anchor="middle" fill="#3b82f6" font-size="24" font-weight="700">4 INDEPENDENT Q-HEADS</text>
+
+  <!-- Head 0 -->
+  <rect x="610" y="225" width="480" height="80" rx="10" fill="#1e293b"/>
+  <text x="630" y="255" fill="#3b82f6" font-size="18" font-weight="700">Head 0 (5m Expiry):</text>
+  <text x="630" y="285" fill="#ffffff" font-size="15">[ Q_WAIT: +0.12 | Q_CALL: -1e9 (Masked) | Q_PUT: +0.45 ]</text>
+
+  <!-- Head 1 -->
+  <rect x="610" y="320" width="480" height="80" rx="10" fill="#1e293b"/>
+  <text x="630" y="350" fill="#00ff9d" font-size="18" font-weight="700">Head 1 (15m Expiry): ⭐ SELECTED</text>
+  <text x="630" y="380" fill="#00ff9d" font-size="15">[ Q_WAIT: +0.05 | Q_CALL: +0.89 (MAX) | Q_PUT: -0.32 ]</text>
+
+  <!-- Head 2 -->
+  <rect x="610" y="415" width="480" height="80" rx="10" fill="#1e293b"/>
+  <text x="630" y="445" fill="#ffd700" font-size="18" font-weight="700">Head 2 (30m Expiry):</text>
+  <text x="630" y="475" fill="#ffffff" font-size="15">[ Q_WAIT: +0.65 (MAX) | Q_CALL: +0.42 | Q_PUT: -0.10 ]</text>
+
+  <!-- Head 3 -->
+  <rect x="610" y="510" width="480" height="80" rx="10" fill="#1e293b"/>
+  <text x="630" y="540" fill="#a855f7" font-size="18" font-weight="700">Head 3 (1h Expiry):</text>
+  <text x="630" y="570" fill="#ffffff" font-size="15">[ Q_WAIT: +0.78 (MAX) | Q_CALL: +0.20 | Q_PUT: -0.45 ]</text>
+</svg>

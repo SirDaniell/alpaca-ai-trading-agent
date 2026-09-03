@@ -1,0 +1,391 @@
+{
+  "pbtResults": {
+    "1. Write bug condition exploration tests (BEFORE implementing any fixes)": {
+      "status": "passed",
+      "failingExample": "1a (Bug 6): b1_out.grad.abs().mean() = 0.000000 — detach() severs pips/risk/liq/rev gradient path to backbone completely\n1b (Bug 3): target_dir_5m positive rate = 0.5032; constant-0.5 MSE = 0.2500 (at 50/50 entropy floor)\n1c (Bug 5): build_feat_window default = 300 (captured at Cell 7 def time) vs ExecutorQNetwork q_lookback = 64 (Cell 10 line 11) — MISMATCH 300 ≠ 64\n1d (Bug 1): 10 required auxiliary columns absent from CSV (vel_bull_fwd_8, Volatility_Regime_next, all 4 adv_target_next_zone_*, all 4 adv_target_CSM_*); all filled with np.zeros (abs mean = 0.0 <= 1e-7)\n1e (Bug 7): close_5m mean = 259.77, std = 51.75 — absolute GLD price scale fed directly to Conv1D\n1f (Bug 2): avg_reward_WAIT = +0.001, avg_reward_CALL = -0.00052, avg_reward_PUT = -0.00048; WAIT dominates by 0.00148\n1g (Bug 4): buffer had 100 items after epoch 0, reset to 0 at start of epoch 1 (init inside loop)",
+      "lastRunTimestamp": 1788325552947
+    }
+  },
+  "executionHistory": {
+    "1. Write bug condition exploration tests (BEFORE implementing any fixes)": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323653090
+      },
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323662778
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788325592664
+      }
+    ],
+    "2. Write preservation property tests (BEFORE implementing any fixes)": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323653187
+      },
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323663455
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788325593343
+      }
+    ],
+    "3.1 Remove `.detach()` from `branch_cat` and `aux1`/`aux2` in `SignalMetaNetwork.forward()`": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323653329
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788325602068
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788326184423
+      }
+    ],
+    "3.2 Verify Bug 6 exploration test now passes (Property 1: Expected Behavior — Backbone Gradient)": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323653414
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788326192161
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788326328971
+      }
+    ],
+    "3.3 Verify preservation tests still pass": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323653489
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788326336846
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788326343531
+      }
+    ],
+    "4.1 Add ATR-threshold direction weights to Cell 9 target preparation block": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323653566
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788326351442
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788326903891
+      }
+    ],
+    "4.2 Apply `direction_weight` to `l_q` in the Phase 1 training loop (Cell 9)": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323653640
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788326912987
+      }
+    ],
+    "4.3 Verify Bug 3 exploration test now passes (Property 1: Expected Behavior — Direction Labels)": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323653728
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788326919996
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788327918017
+      }
+    ],
+    "4.4 Verify preservation tests still pass": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323653797
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788328856962
+      }
+    ],
+    "5.1 Remove Q_LOOKBACK re-definitions from Cells 7 and 10; add execution-order assertion": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323653953
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788328872434
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788329156494
+      }
+    ],
+    "5.2 Fix `build_feat_window` default argument binding to use call-time Q_LOOKBACK": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323654018
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788329162889
+      }
+    ],
+    "5.3 Verify Bug 5 exploration test now passes (Property 1: Expected Behavior — Q_LOOKBACK Consistency)": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323654096
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788329172298
+      }
+    ],
+    "5.4 Verify preservation tests still pass": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323654166
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788329177805
+      }
+    ],
+    "6.1 Define explicit permanently-zero key set and add post-synthesis validation in Cell 8": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323654243
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788329186656
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788329917913
+      }
+    ],
+    "6.2 Replace per-step runtime mean checks in Cell 9 loss computation with pre-computed exclusion set": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323654319
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788329932850
+      }
+    ],
+    "6.3 Verify Bug 1 exploration test now passes (Property 1: Expected Behavior — ML Targets Non-Zero)": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323654390
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788329948791
+      }
+    ],
+    "6.4 Verify preservation tests still pass": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323654467
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788329967610
+      }
+    ],
+    "7.1 Replace `meta_strength`-dependent WAIT penalty with ATR-normalized move size proxy": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323654532
+      },
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788330288494
+      }
+    ],
+    "7.2 Add per-epoch reward distribution logging and dominance assertion": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323654601
+      }
+    ],
+    "7.3 Verify Bug 2 exploration test now passes (Property 1: Expected Behavior — WAIT Fraction)": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323654674
+      }
+    ],
+    "7.4 Verify preservation tests still pass": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323654756
+      }
+    ],
+    "8.1 Add explicit `import collections` and align `BUFFER_CAPACITY` with deque maxlen": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323654828
+      }
+    ],
+    "8.2 Verify Bug 4 exploration test now passes (Property 1: Expected Behavior — Buffer Persists)": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323654912
+      }
+    ],
+    "8.3 Verify preservation tests still pass": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323655006
+      }
+    ],
+    "9.1 Identify price-level feature indices after `feature_cols` is defined (Cell 6)": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323655092
+      }
+    ],
+    "9.2 Compute training-set normalization statistics (Cell 9, before training loop)": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323655165
+      }
+    ],
+    "9.3 Update `build_feat_window` to apply per-window price normalization and training-set normalization for other features (Cell 7)": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323655241
+      }
+    ],
+    "9.4 Update all `build_feat_window` call sites in Cells 10, 11, and `_batch_from_index_replay` to use `_fw` wrapper": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323655316
+      }
+    ],
+    "9.5 Verify Bug 7 exploration test now passes (Property 1: Expected Behavior — Normalized Feature Windows)": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323655389
+      }
+    ],
+    "9.6 Verify preservation tests still pass": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323655464
+      }
+    ],
+    "10. Checkpoint — Ensure all bug condition tests pass and all preservation tests still pass": [
+      {
+        "executionId": "fa79d9e9-ba48-40bd-acce-17704c5667a9",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788323655545
+      }
+    ],
+    "3. Fix Bug 6 — Remove `.detach()` from Auxiliary Head Inputs (Cell 6)": [
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788326343614
+      }
+    ],
+    "4. Fix Bug 3 — Zone-Conditional Direction Labels with ATR-Threshold Weighting (Cell 9)": [
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788328857049
+      }
+    ],
+    "5. Fix Bug 5 — Consolidate Q_LOOKBACK to Single Definition (Cells 2, 7, 10)": [
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788329177891
+      }
+    ],
+    "6. Fix Bug 1 — Harden ML Target Synthesis and Loss Gating (Cells 8 and 9)": [
+      {
+        "executionId": "963f06b7-6054-4374-a97c-16b6cd03acd5",
+        "chatSessionId": "sess_dc2eda21-cb81-4a5e-a0cd-419a348050e9",
+        "timestamp": 1788329967693
+      }
+    ]
+  }
+}

@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 675" width="1200" height="675" style="background:#0b0e14; font-family: system-ui, -apple-system, sans-serif;">
+  <rect width="1200" height="675" fill="#0b0e14"/>
+  <text x="600" y="70" text-anchor="middle" fill="#ffffff" font-size="32" font-weight="700">MODEL 2: Q-EXECUTOR (DUAL INPUTS)</text>
+  <text x="600" y="105" text-anchor="middle" fill="#00f0ff" font-size="18" font-weight="500">Spatial/Temporal Feature Window + 28-Dim Market Context State</text>
+
+  <!-- Branch A -->
+  <rect x="80" y="140" width="490" height="320" rx="16" fill="#151d2a" stroke="#00f0ff" stroke-width="2"/>
+  <text x="325" y="185" text-anchor="middle" fill="#00f0ff" font-size="22" font-weight="700">Branch A: Feature Window</text>
+  <text x="325" y="215" text-anchor="middle" fill="#94a3b8" font-size="15">300 Bars × 92 Technical Indicators</text>
+  <rect x="120" y="250" width="410" height="50" rx="8" fill="#1e293b"/>
+  <text x="325" y="282" text-anchor="middle" fill="#ffffff" font-size="16">Dual Conv1D Towers (64 &amp; 128 Filters)</text>
+  <rect x="120" y="320" width="410" height="50" rx="8" fill="#1e293b"/>
+  <text x="325" y="352" text-anchor="middle" fill="#ffffff" font-size="16">LSTM Sequence Trunk (256 Units)</text>
+  <rect x="120" y="390" width="410" height="50" rx="8" fill="#00f0ff" opacity="0.2"/>
+  <text x="325" y="422" text-anchor="middle" fill="#00f0ff" font-size="16" font-weight="700">Spatial Output Vector (128-dim)</text>
+
+  <!-- Branch B -->
+  <rect x="630" y="140" width="490" height="320" rx="16" fill="#1d1928" stroke="#a855f7" stroke-width="2"/>
+  <text x="875" y="185" text-anchor="middle" fill="#a855f7" font-size="22" font-weight="700">Branch B: Context State</text>
+  <text x="875" y="215" text-anchor="middle" fill="#94a3b8" font-size="15">28-Dimensional Static Market State</text>
+  <text x="660" y="260" fill="#e2e8f0" font-size="14">• HTF Meta Scores &amp; Reversal Prob</text>
+  <text x="660" y="290" fill="#e2e8f0" font-size="14">• 4 Per-Horizon Convictions</text>
+  <text x="660" y="320" fill="#e2e8f0" font-size="14">• Open Position Tracker Flag</text>
+  <text x="660" y="350" fill="#e2e8f0" font-size="14">• Normalized ATR &amp; S/R Distances</text>
+  <text x="660" y="380" fill="#e2e8f0" font-size="14">• NYSE Open &amp; Power Hour Encodings</text>
+  <rect x="650" y="390" width="450" height="50" rx="8" fill="#a855f7" opacity="0.2"/>
+  <text x="875" y="422" text-anchor="middle" fill="#a855f7" font-size="16" font-weight="700">Context Output Vector (128-dim)</text>
+
+  <!-- Fusion Output -->
+  <rect x="300" y="500" width="600" height="120" rx="16" fill="#111622" stroke="#00ff9d" stroke-width="2"/>
+  <text x="600" y="545" text-anchor="middle" fill="#00ff9d" font-size="24" font-weight="700">FEATURE FUSION (DENSE 256)</text>
+  <text x="600" y="580" text-anchor="middle" fill="#94a3b8" font-size="16">Concatenates Spatial Pattern + Market Context Vector</text>
+</svg>

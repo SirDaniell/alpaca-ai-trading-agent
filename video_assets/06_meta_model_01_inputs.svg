@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 675" width="1200" height="675" style="background:#0b0e14; font-family: system-ui, -apple-system, sans-serif;">
+  <rect width="1200" height="675" fill="#0b0e14"/>
+  <text x="600" y="70" text-anchor="middle" fill="#ffffff" font-size="32" font-weight="700">MODEL 1: META-LEARNER (INPUT MATRIX)</text>
+  <text x="600" y="105" text-anchor="middle" fill="#00f0ff" font-size="18" font-weight="500">What It Reads: 150-Bar Historical Market Lookback Window</text>
+
+  <rect x="80" y="140" width="1040" height="480" rx="20" fill="#111622" stroke="#00f0ff" stroke-opacity="0.4" stroke-width="2"/>
+
+  <!-- 4 Input Columns -->
+  <!-- Box 1 -->
+  <rect x="120" y="180" width="220" height="380" rx="12" fill="#1a2234" stroke="#2a3650" stroke-width="2"/>
+  <text x="230" y="225" text-anchor="middle" fill="#00f0ff" font-size="20" font-weight="600">RSI Momentum</text>
+  <path d="M 140 320 Q 180 250 220 340 T 320 280" fill="none" stroke="#00f0ff" stroke-width="4"/>
+  <text x="230" y="420" text-anchor="middle" fill="#94a3b8" font-size="15">Wilder 14-Period RSI</text>
+  <text x="230" y="450" text-anchor="middle" fill="#94a3b8" font-size="15">Multi-TF Alignment</text>
+
+  <!-- Box 2 -->
+  <rect x="370" y="180" width="220" height="380" rx="12" fill="#1a2234" stroke="#2a3650" stroke-width="2"/>
+  <text x="480" y="225" text-anchor="middle" fill="#00ff9d" font-size="20" font-weight="600">SNR Zones</text>
+  <line x1="390" y1="280" x2="550" y2="280" stroke="#00ff9d" stroke-dasharray="4" stroke-width="3"/>
+  <line x1="390" y1="360" x2="550" y2="360" stroke="#ff4d4d" stroke-dasharray="4" stroke-width="3"/>
+  <text x="480" y="420" text-anchor="middle" fill="#94a3b8" font-size="15">Support / Resistance</text>
+  <text x="480" y="450" text-anchor="middle" fill="#94a3b8" font-size="15">Proximity &amp; Touches</text>
+
+  <!-- Box 3 -->
+  <rect x="620" y="180" width="220" height="380" rx="12" fill="#1a2234" stroke="#2a3650" stroke-width="2"/>
+  <text x="730" y="225" text-anchor="middle" fill="#ffd700" font-size="20" font-weight="600">Volume Profile</text>
+  <rect x="650" y="320" width="30" height="60" fill="#00ff9d" opacity="0.8"/>
+  <rect x="690" y="280" width="30" height="100" fill="#ff4d4d" opacity="0.8"/>
+  <rect x="730" y="300" width="30" height="80" fill="#00ff9d" opacity="0.8"/>
+  <text x="730" y="420" text-anchor="middle" fill="#94a3b8" font-size="15">Buy vs Sell Pressure</text>
+  <text x="730" y="450" text-anchor="middle" fill="#94a3b8" font-size="15">Volume Delta Ratio</text>
+
+  <!-- Box 4 -->
+  <rect x="870" y="180" width="220" height="380" rx="12" fill="#1a2234" stroke="#2a3650" stroke-width="2"/>
+  <text x="980" y="225" text-anchor="middle" fill="#a855f7" font-size="20" font-weight="600">DXY Correlation</text>
+  <path d="M 890 300 L 940 350 L 990 280 L 1040 330" fill="none" stroke="#a855f7" stroke-width="4"/>
+  <text x="980" y="420" text-anchor="middle" fill="#94a3b8" font-size="15">Gold vs Dollar Index</text>
+  <text x="980" y="450" text-anchor="middle" fill="#94a3b8" font-size="15">Macro Divergence</text>
+</svg>
