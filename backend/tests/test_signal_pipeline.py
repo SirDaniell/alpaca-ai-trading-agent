@@ -13,6 +13,7 @@ from app.core.market.mtf_rsi import (
 from app.core.market.divergence_scale import build_unified_divergence_scale, rolling_pct_change, rolling_z_score
 from app.core.market.signal_events import build_signal_bundle
 from app.core.ml.meta_learner import ForwardMoveRewardCalculator
+from app.core.ml.ml_dataset_preparation import DatasetConfig, MLDatasetPreparation
 from app.db.models import LearnerCheckpoint, SignalOutcome
 
 
@@ -104,3 +105,23 @@ def test_signal_outcome_repository_shape():
     )
     assert outcome.signal_id == "sig-1"
     assert outcome.feature_names[0] == "rsi"
+
+
+def test_next_zone_targets_include_stable_zone_type():
+    size = 32
+    close = np.linspace(100.0, 101.0, size)
+    frame = pd.DataFrame({
+        "close_5m": close,
+        "high_5m": close + 0.5,
+        "low_5m": close - 0.5,
+        "r1": close + 0.25,
+        "r2": close + 0.5,
+        "r3": close + 0.75,
+        "s1": close - 0.25,
+        "s2": close - 0.5,
+        "s3": close - 0.75,
+    })
+    preparer = MLDatasetPreparation(frame, config=DatasetConfig())
+    added = preparer._compute_next_zone_targets(n_future=4, zone_touch_pct=0.004)
+    assert "adv_target_next_zone_type" in added
+    assert set(preparer.data["adv_target_next_zone_type"].unique()).issubset({-1.0, 0.0, 1.0})

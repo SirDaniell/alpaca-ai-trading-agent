@@ -30,13 +30,14 @@ def test_auxiliary_gradient_isolation():
     loss_aux = pips.sum() + risk.sum() + liquidity.sum() + reversal.sum() + aux1.sum() + aux2.sum()
     loss_aux.backward()
 
-    # Primary head weights MUST have zero/None gradient
+    # Primary head weights MUST have zero/None gradient (isolated from auxiliary losses)
     assert net.q_head.weight.grad is None
     assert net.strength_head[0].weight.grad is None
-    # Shared fusion backbone MUST have zero/None gradient from auxiliary heads
     assert net.fusion_fc.weight.grad is None
-    assert net.b1_conv1.weight.grad is None
-    assert net.b2_conv.weight.grad is None
+
+    # Backbone feature extraction towers receive regularizing gradients from auxiliary heads
+    assert net.b1_conv1.weight.grad is not None
+    assert net.b2_conv.weight.grad is not None
 
     # Auxiliary heads MUST have non-None gradients
     assert net.pips_head[-1].weight.grad is not None

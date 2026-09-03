@@ -49,6 +49,7 @@ TARGET LABELS (37 total for Meta-Learner training):
 """
 
 import argparse
+import json
 import os
 import sys
 import logging
@@ -73,12 +74,25 @@ from app.core.ml.ml_dataset_preparation import MLDatasetPreparation, DatasetConf
 
 
 def _calculate_rsi(series: pd.Series, window: int = 14) -> pd.Series:
-    """Calculate standard 14-period RSI."""
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0).rolling(window).mean()
-    loss = (-delta.where(delta < 0, 0.0).abs()).rolling(window).mean()
-    rs = gain / (loss + 1e-8)
-    return (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
+    """Calculate causal Wilder RSI on a price series."""
+    prices = pd.to_numeric(series, errors="coerce").astype(float)
+    delta = prices.diff().fillna(0.0)
+    gains = delta.clip(lower=0.0)
+    losses = -delta.clip(upper=0.0)
+    avg_gain = gains.ewm(alpha=1.0 / window, adjust=False, min_periods=1).mean()
+    avg_loss = losses.ewm(alpha=1.0 / window, adjust=False, min_periods=1).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    rsi = rsi.where(avg_loss > 0.0, 100.0)
+    rsi = rsi.where(avg_gain > 0.0, 0.0)
+    rsi = rsi.where((avg_gain > 0.0) & (avg_loss > 0.0), 50.0)
+    return rsi.clip(0.0, 100.0).fillna(50.0)
+
+
+def _with_timeframe_suffix(column: str, timeframe: str) -> str:
+    """Append a timeframe suffix exactly once."""
+    suffix = f"_{timeframe}"
+    return column if column.endswith(suffix) else f"{column}{suffix}"
 
 
 def _compute_ml_targets(df: pd.DataFrame) -> pd.DataFrame:
@@ -97,49 +111,168 @@ def _compute_ml_targets(df: pd.DataFrame) -> pd.DataFrame:
     
     Returns: DataFrame with all targets added
     """
-    try:
-        logger.info("[MLTargets] Initializing MLDatasetPreparation for advanced target computation...")
-        prep = MLDatasetPreparation(df.copy(), config=DatasetConfig())
+    logger.info("[MLTargets] Initializing MLDatasetPreparation for advanced target computation...")
+    prep_frame = df.copy()
+    source_columns = (
+        "Price_Velocity_Bull", "Price_Velocity_Bear", "Price_Velocity_Net",
+        "Volatility_Regime", "Volatility_Expansion", "Volatility_Bull", "Volatility_Bear",
+        "Regime_Speed_Bull", "Regime_Speed_Bear", "Regime_Speed_Aligned", "Regime_Speed_Divergence",
+    )
+    for source_column in source_columns:
+        candidates = [source_column, f"{source_column}_5m", f"{source_column}_5m_5m"]
+        source = next((candidate for candidate in candidates if candidate in prep_frame.columns), None)
+        if source_column not in prep_frame.columns and source is not None:
+            prep_frame[source_column] = prep_frame[source]
+    prep = MLDatasetPreparation(prep_frame, config=DatasetConfig())
         
-        # Zone Liquidity Targets (5 targets)
-        logger.info("[MLTargets] Computing zone liquidity targets...")
-        zone_cols = prep._compute_next_zone_targets(n_future=20, zone_touch_pct=0.004)
-        logger.info(f"[MLTargets] ✅ Added {len(zone_cols)} zone targets: {zone_cols}")
+    # Zone Liquidity Targets (5 targets)
+    logger.info("[MLTargets] Computing zone liquidity targets...")
+    zone_cols = prep._compute_next_zone_targets(n_future=20, zone_touch_pct=0.004)
+    logger.info(f"[MLTargets] Added {len(zone_cols)} zone targets: {zone_cols}")
         
-        # Volatility Regime + Expansion Targets (6 targets)
-        logger.info("[MLTargets] Computing volatility regime targets...")
-        vol_cols = prep._compute_forward_volatility_targets(n_future=8, decay=0.85)
-        logger.info(f"[MLTargets] ✅ Added {len(vol_cols)} volatility targets: {vol_cols}")
+    # Volatility Regime + Expansion Targets (6 targets)
+    logger.info("[MLTargets] Computing volatility regime targets...")
+    vol_cols = prep._compute_forward_volatility_targets(n_future=8, decay=0.85)
+    logger.info(f"[MLTargets] Added {len(vol_cols)} volatility targets: {vol_cols}")
         
-        # Regime Speed Targets (6 targets)
-        logger.info("[MLTargets] Computing regime speed targets...")
-        speed_cols = prep._compute_forward_regime_speed_targets(n_future=8, decay=0.85)
-        logger.info(f"[MLTargets] ✅ Added {len(speed_cols)} regime speed targets: {speed_cols}")
+    # Regime Speed Targets (6 targets)
+    logger.info("[MLTargets] Computing regime speed targets...")
+    speed_cols = prep._compute_forward_regime_speed_targets(n_future=8, decay=0.85)
+    logger.info(f"[MLTargets] Added {len(speed_cols)} regime speed targets: {speed_cols}")
         
-        # Price Velocity Targets (6 targets)
-        logger.info("[MLTargets] Computing price velocity targets...")
-        vel_cols = prep._compute_forward_velocity_targets(n_future=8, decay=0.85)
-        logger.info(f"[MLTargets] ✅ Added {len(vel_cols)} velocity targets: {vel_cols}")
+    # Price Velocity Targets (6 targets)
+    logger.info("[MLTargets] Computing price velocity targets...")
+    vel_cols = prep._compute_forward_velocity_targets(n_future=8, decay=0.85)
+    logger.info(f"[MLTargets] Added {len(vel_cols)} velocity targets: {vel_cols}")
         
-        # Currency Divergence Targets (4 targets, optional)
-        logger.info("[MLTargets] Computing currency divergence (CSM) targets...")
-        csm_cols = prep._compute_forward_csm_targets()
-        if csm_cols:
-            logger.info(f"[MLTargets] ✅ Added {len(csm_cols)} CSM targets: {csm_cols}")
-        else:
-            logger.info("[MLTargets] ℹ No CSM columns available (optional)")
+    # Currency Divergence Targets (4 targets, optional)
+    logger.info("[MLTargets] Computing currency divergence (CSM) targets...")
+    csm_cols = prep._compute_forward_csm_targets()
+    if csm_cols:
+        logger.info(f"[MLTargets] Added {len(csm_cols)} CSM targets: {csm_cols}")
+    else:
+        logger.info("[MLTargets] No CSM columns available (optional)")
         
-        # Get the enriched DataFrame from the preparator
-        df_enriched = prep.data
+    # Get the enriched DataFrame from the preparator
+    df_enriched = prep.data
+    target_aliases = {
+        "adv_target_Volatility_Bull_next": "Volatility_Bull_next",
+        "adv_target_Volatility_Bear_next": "Volatility_Bear_next",
+        "adv_target_Volatility_Regime_next": "Volatility_Regime_next",
+        "adv_target_Volatility_Expansion_next": "Volatility_Expansion_next",
+        "adv_target_Regime_Speed_Bull_next": "Regime_Speed_Bull_next",
+        "adv_target_Regime_Speed_Bear_next": "Regime_Speed_Bear_next",
+        "adv_target_Price_Velocity_Bull_next": "Price_Velocity_Bull_next",
+        "adv_target_Price_Velocity_Bear_next": "Price_Velocity_Bear_next",
+        "adv_target_Price_Velocity_Net_next": "Price_Velocity_Net_next",
+        "adv_target_vel_bull_fwd_8": "vel_bull_fwd_8",
+        "adv_target_vel_bear_fwd_8": "vel_bear_fwd_8",
+        "adv_target_vel_net_fwd_8": "vel_net_fwd_8",
+    }
+    for source_column, target_column in target_aliases.items():
+        if source_column in df_enriched.columns:
+            df_enriched[target_column] = df_enriched[source_column]
+    helper_columns = [column for column in source_columns if column not in df.columns]
+    df_enriched.drop(columns=helper_columns, inplace=True, errors="ignore")
         
-        total_added = len(zone_cols) + len(vol_cols) + len(speed_cols) + len(vel_cols) + len(csm_cols)
-        logger.info(f"[MLTargets] ✅ COMPLETE! Added {total_added} advanced ML targets")
-        
-        return df_enriched
-        
-    except Exception as e:
-        logger.warning(f"[MLTargets] ⚠️  Error during ML target computation: {e}. Continuing without advanced targets.")
-        return df
+    required = [
+        "adv_target_next_zone_idx", "adv_target_next_zone_bars",
+        "adv_target_next_zone_distance", "adv_target_next_zone_volume",
+        "Volatility_Bull_next", "Volatility_Bear_next", "Volatility_Regime_next",
+        "Volatility_Expansion_next", "Regime_Speed_Bull_next", "Regime_Speed_Bear_next",
+        "Price_Velocity_Bull_next", "Price_Velocity_Bear_next", "Price_Velocity_Net_next",
+        "vel_bull_fwd_8", "vel_bear_fwd_8", "vel_net_fwd_8",
+    ]
+    missing = [column for column in required if column not in df_enriched.columns]
+    if missing:
+        raise RuntimeError(f"[MLTargets] Required target columns missing after enrichment: {missing}")
+    total_added = len(zone_cols) + len(vol_cols) + len(speed_cols) + len(vel_cols) + len(csm_cols)
+    logger.info(f"[MLTargets] COMPLETE: added {total_added} advanced ML targets")
+    return df_enriched
+
+
+REQUIRED_TARGET_COLUMNS = [
+    "target_dir_5m", "target_dir_15m", "target_dir_30m", "target_dir_1h",
+    "forward_move_1", "forward_move_3", "forward_move_6", "forward_move_12",
+    "adv_target_next_zone_idx", "adv_target_next_zone_bars",
+    "adv_target_next_zone_distance", "adv_target_next_zone_volume",
+    "adv_target_next_zone_type", "Volatility_Bull_next", "Volatility_Bear_next",
+    "Volatility_Regime_next", "Volatility_Expansion_next", "Regime_Speed_Bull_next",
+    "Regime_Speed_Bear_next", "Price_Velocity_Bull_next", "Price_Velocity_Bear_next",
+    "Price_Velocity_Net_next", "vel_bull_fwd_8", "vel_bear_fwd_8", "vel_net_fwd_8",
+]
+
+
+def _validate_enriched_frame(df: pd.DataFrame) -> None:
+    """Fail before export if the notebook contract is incomplete or non-finite."""
+    required = [
+        "ATR_5m", "EMA_8_5m", "EMA_12_5m", "Bar_Volume_Up_5m", "Bar_Volume_Down_5m",
+        "rsi_5m", "RSI_14_5m", "MACD_5m", "BB_Middle_5m", "Regime_Speed_Bull_5m",
+        "mtf_snr_confluence", "snr_dist_support_5m", "snr_dist_resistance_5m",
+        "dxy_snr_dist_support_5m", "dxy_snr_dist_resistance_5m",
+    ] + REQUIRED_TARGET_COLUMNS
+    missing = [column for column in required if column not in df.columns]
+    if missing:
+        raise RuntimeError(f"Enriched dataset missing required columns: {missing}")
+
+    for column in required:
+        values = pd.to_numeric(df[column], errors="coerce")
+        if not np.isfinite(values.to_numpy()).all():
+            raise RuntimeError(f"Enriched dataset contains non-finite values in {column}")
+
+    rsi = pd.to_numeric(df["rsi_5m"], errors="coerce")
+    if not (rsi.between(0.0, 100.0).all() and 20.0 < float(rsi.mean()) < 80.0 and float(rsi.std()) < 40.0):
+        raise RuntimeError(
+            f"Invalid rsi_5m statistics: mean={float(rsi.mean()):.4f}, std={float(rsi.std()):.4f}, "
+            f"range=({float(rsi.min()):.4f}, {float(rsi.max()):.4f})"
+        )
+
+    direction_columns = ["target_dir_5m", "target_dir_15m", "target_dir_30m", "target_dir_1h"]
+    for column in direction_columns:
+        values = set(pd.to_numeric(df[column], errors="coerce").unique())
+        if not values.issubset({0, 1}):
+            raise RuntimeError(f"Direction target {column} is not binary: {sorted(values)}")
+
+
+def _write_dataset_manifest(
+    aligned: pd.DataFrame,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    path: str,
+) -> None:
+    indicators = [
+        column for column in aligned.columns
+        if column.endswith("_5m") and any(key in column for key in (
+            "EMA_", "ATR", "Bar_Volume", "MACD", "BB_", "Supertrend", "OBV", "SMA_"
+        ))
+    ]
+    targets = [column for column in aligned.columns if (
+        column.startswith("target_dir_") or column.startswith("forward_") or
+        column.startswith("adv_target_") or column.endswith("_next") or "_fwd_" in column
+    )]
+    rsi = pd.to_numeric(train_df["rsi_5m"], errors="coerce")
+    manifest = {
+        "contract_version": "axe-enriched-v1",
+        "n_rows": int(len(aligned)),
+        "n_cols": int(len(aligned.columns)),
+        "split_rows": {"train": len(train_df), "validation": len(val_df), "test": len(test_df)},
+        "ti_nonnull_min": {column: float(aligned[column].notna().mean()) for column in indicators},
+        "rsi_5m_mean": float(rsi.mean()),
+        "rsi_5m_std": float(rsi.std()),
+        "targets_present": sorted(targets),
+        "missing_required_targets": [column for column in REQUIRED_TARGET_COLUMNS if column not in aligned.columns],
+        "empty_5m_indicator_count": int(sum(aligned[column].notna().mean() < 0.95 for column in indicators)),
+        "feature_order": [column for column in aligned.columns if column not in targets and column != "timestamp"],
+        "target_order": sorted(targets),
+        "splits": {"train": 0.70, "validation": 0.15, "test": 0.15},
+        "scaler_fit": "train_only",
+        "lookbacks": {"meta": 150, "q": 150},
+        "snr": {"zone_lookback_period": 500, "zone_min_distance_pct": 0.5, "confluence_pct": 0.0015},
+    }
+    with open(path, "w", encoding="utf-8") as manifest_file:
+        json.dump(manifest, manifest_file, indent=2)
+        manifest_file.write("\n")
 
 
 def build_and_enrich_mtf_dataset(symbol: str = "GLD", limit: int = 50_000):
@@ -229,15 +362,62 @@ def build_and_enrich_mtf_dataset(symbol: str = "GLD", limit: int = 50_000):
     ta_input = primary_df.rename(columns={
         "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"
     })
-    ti_enriched = ti_calc.calculate_all_indicators(ta_input, mode="training")
+    required_ta_columns = {"Open", "High", "Low", "Close", "Volume"}
+    missing_ta_columns = required_ta_columns.difference(ta_input.columns)
+    if missing_ta_columns:
+        raise ValueError(f"TechnicalIndicators input is missing canonical columns: {sorted(missing_ta_columns)}")
 
+    ti_enriched = ti_calc.calculate_all_indicators(ta_input, mode="training")
+    ti_contract = set(TI_NUMERIC_FEATURE_KEYS) | set(IndicatorConfig().get_output_columns())
+    ti_sources = [column for column in ti_contract if column in ti_enriched.columns]
+    ti_missing = sorted(ti_contract.difference(ti_enriched.columns))
     ti_added_count = 0
-    for col in TI_NUMERIC_FEATURE_KEYS:
-        if col in ti_enriched.columns:
-            primary_df[col] = ti_enriched[col].astype(np.float32)
+    for source_column in sorted(ti_sources):
+        target_column = source_column
+        while target_column.endswith("_5m_5m"):
+            target_column = target_column[:-4]
+        if not target_column.endswith("_5m"):
+            target_column = f"{target_column}_5m"
+        values = pd.to_numeric(ti_enriched[source_column], errors="coerce")
+        values = values.replace([np.inf, -np.inf], np.nan)
+        # Warm-up values may be absent; forward fill is causal and the initial
+        # prefix is explicitly represented as zero rather than future-filled.
+        primary_df[target_column] = values.ffill().fillna(0.0).astype(np.float32)
+        ti_added_count += 1
+
+    if ti_added_count <= 50:
+        raise RuntimeError(
+            f"TechnicalIndicators produced only {ti_added_count} contract columns; "
+            f"expected more than 50. Missing examples: {ti_missing[:20]}"
+        )
+    logger.info(
+        "  TechnicalIndicators contract: added=%d missing=%d missing_examples=%s",
+        ti_added_count, len(ti_missing), ti_missing[:10],
+    )
+
+    compatibility_aliases = {
+        "MACD_5m": ("MACD_5m", "MACD_12_26_9_5m", "MACD"),
+        "BB_Middle_5m": ("BB_Middle_5m", "BBM_20_2.0_5m", "BBM_20_2.0_2.0_5m", "BB_Middle"),
+    }
+    for target_column, candidates in compatibility_aliases.items():
+        source_column = next((candidate for candidate in candidates if candidate in primary_df.columns), None)
+        if target_column == "BB_Middle_5m" and source_column is None:
+            source_column = next(
+                (column for column in primary_df.columns if column.startswith("BBM_20_") and column.endswith("_5m")),
+                None,
+            )
+        if source_column is not None and target_column not in primary_df.columns:
+            primary_df[target_column] = primary_df[source_column]
             ti_added_count += 1
-        else:
-            primary_df[col] = 0.0
+        elif target_column == "BB_Middle_5m" and target_column not in primary_df.columns:
+            primary_df[target_column] = primary_df["close"].rolling(20, min_periods=1).mean().astype(np.float32)
+            ti_added_count += 1
+
+    # The MTF RSI is the public notebook feature. Keep it independent from
+    # the TI engine's similarly named RSI outputs.
+    canonical_rsi = _calculate_rsi(primary_df["close"], 14).astype(np.float32)
+    primary_df["rsi"] = canonical_rsi
+    primary_df["RSI_14"] = canonical_rsi
 
     tf_enriched_dfs["5m"] = primary_df
     logger.info("  ✓ Primary 5m dataset enriched with %d Technical Indicators.", ti_added_count)
@@ -246,7 +426,7 @@ def build_and_enrich_mtf_dataset(symbol: str = "GLD", limit: int = 50_000):
     logger.info("📌 Step 4/6: Aligning MTF datasets on primary 5m timeline (+1 HTF interval timestamp shift)...")
     base_df = tf_enriched_dfs["5m"].sort_values("timestamp").copy()
     base_df.columns = [
-        f"{c}_5m" if c != "timestamp" else "timestamp"
+        _with_timeframe_suffix(c, "5m") if c != "timestamp" else "timestamp"
         for c in base_df.columns
     ]
 
@@ -260,7 +440,7 @@ def build_and_enrich_mtf_dataset(symbol: str = "GLD", limit: int = 50_000):
         # Shift timestamp to close time to prevent look-ahead bias
         df_htf["timestamp"] = df_htf["timestamp"] + pd.Timedelta(seconds=interval_s)
         df_htf.columns = [
-            f"{c}_{tf}" if c != "timestamp" else "timestamp"
+            _with_timeframe_suffix(c, tf) if c != "timestamp" else "timestamp"
             for c in df_htf.columns
         ]
 
@@ -272,6 +452,10 @@ def build_and_enrich_mtf_dataset(symbol: str = "GLD", limit: int = 50_000):
         )
 
     aligned.ffill(inplace=True)
+    aligned = aligned.loc[:, ~aligned.columns.duplicated(keep="last")]
+    aligned.replace([np.inf, -np.inf], np.nan, inplace=True)
+    numeric_columns = aligned.select_dtypes(include=[np.number]).columns
+    aligned[numeric_columns] = aligned[numeric_columns].ffill().fillna(0.0)
     aligned = aligned[aligned["timestamp"] >= pd.Timestamp(ltf_anchor)].reset_index(drop=True)
     logger.info("  ✓ Multi-timeframe alignment complete: %d rows | %d total columns", len(aligned), len(aligned.columns))
 
@@ -324,6 +508,14 @@ def build_and_enrich_mtf_dataset(symbol: str = "GLD", limit: int = 50_000):
     aligned = _compute_ml_targets(aligned)
     cols_after = len(aligned.columns)
     logger.info(f"  ✓ ML targets complete: +{cols_after - cols_before} columns added | Total: {cols_after} columns")
+    for target_column in REQUIRED_TARGET_COLUMNS:
+        logger.info(
+            "  target %-40s non-null=%.3f",
+            target_column,
+            float(aligned[target_column].notna().mean()) if target_column in aligned.columns else 0.0,
+        )
+    _validate_enriched_frame(aligned)
+    logger.info("  ✓ Enriched dataset contract and no-lookahead label prerequisites passed")
 
     # 6. Chronological 70/15/15 Partitioning & Train-Only Scaler Fitting
     logger.info("📌 Step 6/6: Partitioning 70/15/15 splits & fitting FeatureScaler EXCLUSIVELY on Train split...")
@@ -363,18 +555,21 @@ def build_and_enrich_mtf_dataset(symbol: str = "GLD", limit: int = 50_000):
     csv_val_path   = f"data/val_{k_label}.csv"
     csv_test_path  = f"data/test_{k_label}.csv"
     csv_full_path  = f"data/full_{k_label}.csv"
+    manifest_path   = f"data/manifest_{k_label}.json"
     zip_export_path = "data/axe_meta_dataset.zip"
 
     train_df.to_csv(csv_train_path, index=False)
     val_df.to_csv(csv_val_path, index=False)
     test_df.to_csv(csv_test_path, index=False)
     aligned.to_csv(csv_full_path, index=False)
+    _write_dataset_manifest(aligned, train_df, val_df, test_df, manifest_path)
 
     with zipfile.ZipFile(zip_export_path, "w", zipfile.ZIP_DEFLATED) as zipf:
         zipf.write(csv_train_path, arcname=f"train_{k_label}.csv")
         zipf.write(csv_val_path,   arcname=f"val_{k_label}.csv")
         zipf.write(csv_test_path,  arcname=f"test_{k_label}.csv")
         zipf.write(csv_full_path,  arcname=f"full_{k_label}.csv")
+        zipf.write(manifest_path,  arcname=f"manifest_{k_label}.json")
 
     zip_mb = os.path.getsize(zip_export_path) / (1024 * 1024)
     logger.info("📦 Exported & zipped multi-timeframe dataset to %s (%.2f MB)", zip_export_path, zip_mb)

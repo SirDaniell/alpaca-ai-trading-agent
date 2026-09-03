@@ -88,7 +88,7 @@ def inspect_symbol_q_data(symbol: str = "GLD"):
     print(f"  - Columns ({len(aligned_df.columns)}): {list(aligned_df.columns[:10])} ...")
 
     # 2. Initialize Models & State Components
-    meta_learner = OnlineSignalMetaLearner(input_dim=SIGNAL_META_FEATURE_COUNT)
+    meta_learner = OnlineSignalMetaLearner()
     q_executor = OptionsQExecutor(device="cpu")
     zone_manager = ZoneSnapshotManager(max_snapshots=20)
     account = AccountContext()

@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from app.core.ml.meta_learner_registry import MetaLearnerModelRegistry, ModelEntry
 from app.core.ml.signal_meta_learner import SIGNAL_META_FEATURE_COUNT, FeatureScaler, OnlineSignalMetaLearner
 from app.core.ml.synthetic_meta_trainer import SyntheticTrainConfig, train_from_synthetic
+from app.core.ml.ti_meta_features import SIGNAL_META_LOOKBACK_BARS
 from app.db.models import Base, LearnerCheckpoint
 
 import numpy as np
@@ -92,10 +93,11 @@ def test_train_split_scaler_only_on_train():
         db=None,
     )
     assert result.metrics.get("scaler_fitted") is True
-    # Scaler samples <= 70% of usable bars (warmup stripped)
     n_scaler = result.metrics.get("scaler_n_samples", 0)
-    usable = 1500 - 1000 - 24  # num_candles - min_warmup - horizon
-    assert n_scaler <= int(usable * 0.75) + 50, f"Scaler fitted on too many samples: {n_scaler}"
+    train_end = int(1500 * 0.70)
+    min_warmup = max(80, SIGNAL_META_LOOKBACK_BARS)
+    usable_train = train_end - min_warmup - 24
+    assert n_scaler == usable_train, f"Scaler fitted on unexpected number of samples: {n_scaler} (expected {usable_train})"
 
 
 def test_val_eval_metrics_present_in_result():

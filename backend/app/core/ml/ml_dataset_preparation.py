@@ -2183,10 +2183,10 @@ class MLDatasetPreparation:
         df = self.data
 
         # ── Column resolution ────────────────────────────────────────────────
-        close_col = next((c for c in df.columns if c.lower() == "close"), None)
-        high_col  = next((c for c in df.columns if c.lower() == "high"),  None)
-        low_col   = next((c for c in df.columns if c.lower() == "low"),   None)
-        atr_col   = next((c for c in df.columns if c.lower() == "atr"),   None)
+        close_col = next((c for c in ("close", "Close", "close_5m", "Close_5m") if c in df.columns), None)
+        high_col  = next((c for c in ("high", "High", "high_5m", "High_5m") if c in df.columns), None)
+        low_col   = next((c for c in ("low", "Low", "low_5m", "Low_5m") if c in df.columns), None)
+        atr_col   = next((c for c in ("ATR", "atr", "ATR_5m", "atr_5m") if c in df.columns), None)
 
         if not all([close_col, high_col, low_col]):
             logger.debug("[NextZone] OHLC columns missing — skipping next-zone targets")
@@ -2199,14 +2199,17 @@ class MLDatasetPreparation:
             for c in candidates:
                 if c in df.columns:
                     return c
+                for suffix in ("_5m", "_5m_5m"):
+                    if f"{c}{suffix}" in df.columns:
+                        return f"{c}{suffix}"
             return None
 
-        r1_col = _find_col(["r1", "R1", "Pivot_R1", "Pivot_R1_Diff", "Pivot_R1_Price", "r1_price"])
-        r2_col = _find_col(["r2", "R2", "Pivot_R2", "Pivot_R2_Diff", "Pivot_R2_Price", "r2_price"])
-        r3_col = _find_col(["r3", "R3", "Pivot_R3", "Pivot_R3_Diff", "Pivot_R3_Price", "r3_price"])
-        s1_col = _find_col(["s1", "S1", "Pivot_S1", "Pivot_S1_Diff", "Pivot_S1_Price", "s1_price"])
-        s2_col = _find_col(["s2", "S2", "Pivot_S2", "Pivot_S2_Diff", "Pivot_S2_Price", "s2_price"])
-        s3_col = _find_col(["s3", "S3", "Pivot_S3", "Pivot_S3_Diff", "Pivot_S3_Price", "s3_price"])
+        r1_col = _find_col(["r1", "R1", "r1_5m", "R1_5m", "Pivot_R1", "Pivot_R1_Diff", "Pivot_R1_Price", "r1_price"])
+        r2_col = _find_col(["r2", "R2", "r2_5m", "R2_5m", "Pivot_R2", "Pivot_R2_Diff", "Pivot_R2_Price", "r2_price"])
+        r3_col = _find_col(["r3", "R3", "r3_5m", "R3_5m", "Pivot_R3", "Pivot_R3_Diff", "Pivot_R3_Price", "r3_price"])
+        s1_col = _find_col(["s1", "S1", "s1_5m", "S1_5m", "Pivot_S1", "Pivot_S1_Diff", "Pivot_S1_Price", "s1_price"])
+        s2_col = _find_col(["s2", "S2", "s2_5m", "S2_5m", "Pivot_S2", "Pivot_S2_Diff", "Pivot_S2_Price", "s2_price"])
+        s3_col = _find_col(["s3", "S3", "s3_5m", "S3_5m", "Pivot_S3", "Pivot_S3_Diff", "Pivot_S3_Price", "s3_price"])
 
         pivot_cols = [r1_col, r2_col, r3_col, s1_col, s2_col, s3_col]
         pivot_types = ["resistance", "resistance", "resistance",
@@ -2228,8 +2231,8 @@ class MLDatasetPreparation:
         K = 6          # total candidate slots (r1/r2/r3/s1/s2/s3)
         NONE_IDX = K   # class label when no zone reached in window
 
-        vol_col      = "snr_nearest_zone_volume"
-        zonal_col    = "Zonal_Total_Volume" if "Zonal_Total_Volume" in df.columns else None
+        vol_col      = next((c for c in ("snr_nearest_zone_volume", "snr_nearest_zone_volume_5m") if c in df.columns), None)
+        zonal_col    = next((c for c in ("Zonal_Total_Volume", "Zonal_Total_Volume_5m") if c in df.columns), None)
 
         n = len(df)
 
@@ -2325,12 +2328,20 @@ class MLDatasetPreparation:
         df["adv_target_next_zone_bars"]     = next_zone_bars
         df["adv_target_next_zone_distance"] = next_zone_distance
         df["adv_target_next_zone_volume"]   = next_zone_volume
+        # 0=support, 1=resistance, -1=no zone reached. This is a stable
+        # scalar companion to the categorical zone-index target.
+        df["adv_target_next_zone_type"] = np.where(
+            next_zone_idx >= NONE_IDX,
+            -1.0,
+            (next_zone_idx < 3).astype(np.float32),
+        ).astype(np.float32)
 
         added = [
             "adv_target_next_zone_idx",
             "adv_target_next_zone_bars",
             "adv_target_next_zone_distance",
             "adv_target_next_zone_volume",
+            "adv_target_next_zone_type",
         ]
 
         # ── Diagnostics ──────────────────────────────────────────────────────

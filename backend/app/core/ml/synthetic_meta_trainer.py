@@ -92,7 +92,7 @@ def _atr_pips(candles: List[Dict[str, Any]], index: int, symbol: str, lookback: 
 
 def _load_or_create_learner(db: Optional[Session], scope: str, symbol: str = "AAPL") -> OnlineSignalMetaLearner:
     """Load the most recent active checkpoint for (scope, symbol), else create fresh."""
-    learner = OnlineSignalMetaLearner(input_dim=SIGNAL_META_FEATURE_COUNT)
+    learner = OnlineSignalMetaLearner()
     if db is None:
         return learner
     row = (

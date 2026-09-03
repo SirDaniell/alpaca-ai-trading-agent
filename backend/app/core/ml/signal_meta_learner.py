@@ -629,8 +629,8 @@ class SignalMetaNetwork(nn.Module):
         b3_out = torch.relu(self.b3_fc(b3_gap))  # (B, 32)
 
         # ── Auxiliary Supervision & StopGradient Detaching ───────────────────
-        aux1 = self.aux1_head(b1_out.detach())
-        aux2 = self.aux2_head(b2_out.detach())
+        aux1 = self.aux1_head(b1_out)
+        aux2 = self.aux2_head(b2_out)
 
         aux1_sg = aux1.detach()
         aux2_sg = aux2.detach()
@@ -647,8 +647,8 @@ class SignalMetaNetwork(nn.Module):
         # Fusion selector: raw logits for optimal horizon index (used in train_step only)
         selector_logits = self.fusion_selector(feat)
 
-        # ── Private-projection auxiliary heads (Zero Gradient Interference) ─
-        branch_cat = self.branch_ln(torch.cat([b1_out, b2_out, b3_out], dim=-1).detach())  # (B, 128)
+        # ── Private-projection auxiliary heads (Gradients flow through branch outputs) ─
+        branch_cat = self.branch_ln(torch.cat([b1_out, b2_out, b3_out], dim=-1))  # (B, 128)
 
         pips      = self.pips_head(self.pips_ln(self.pips_proj(branch_cat)))
         risk      = self.risk_head(self.risk_ln(self.risk_proj(branch_cat)))

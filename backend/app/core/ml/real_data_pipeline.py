@@ -231,7 +231,7 @@ def train_sequential_two_tier(
     logger.info("=== STARTING SEQUENTIAL TWO-TIER TRAINING FOR %s ===", symbol)
 
     # 1. Initialize Models
-    meta_learner = OnlineSignalMetaLearner(input_dim=SIGNAL_META_FEATURE_COUNT)
+    meta_learner = OnlineSignalMetaLearner()
     q_executor = OptionsQExecutor(device=config.device)
     zone_manager = ZoneSnapshotManager(max_snapshots=20)
 

@@ -578,9 +578,9 @@ class SignalMetaNetwork(nn.Module):
         b3_gap = torch.mean(b3_c, dim=-1)
         b3_out = torch.relu(self.b3_fc(b3_gap))
 
-        # Aux heads (detached)
-        aux1 = self.aux1_head(b1_out.detach())
-        aux2 = self.aux2_head(b2_out.detach())
+        # Aux heads connected to backbone — gradients flow through b1_out, b2_out, b3_out to Conv1D/LSTM towers
+        aux1 = self.aux1_head(b1_out)
+        aux2 = self.aux2_head(b2_out)
         aux1_sg = aux1.detach()
         aux2_sg = aux2.detach()
 
@@ -593,8 +593,8 @@ class SignalMetaNetwork(nn.Module):
         strength = self.strength_head(feat)
         selector_logits = self.fusion_selector(feat)
 
-        # Private Aux Heads on detached branch concatenation
-        branch_cat = self.branch_ln(torch.cat([b1_out, b2_out, b3_out], dim=-1).detach())
+        # Auxiliary Heads — connected to backbone for regularization (pips/risk/liq/rev gradients flow to Conv1D/LSTM)
+        branch_cat = self.branch_ln(torch.cat([b1_out, b2_out, b3_out], dim=-1))
 
         pips      = self.pips_head(self.pips_ln(self.pips_proj(branch_cat)))
         risk      = self.risk_head(self.risk_ln(self.risk_proj(branch_cat)))
@@ -607,52 +607,91 @@ class SignalMetaNetwork(nn.Module):
 
 
 class ExecutorQNetwork(nn.Module):
+    '''
+    Dual-specialist Q net (per horizon):
+      Shared trunk  — Conv1D features + 28-dim context fusion
+      Buy tower     — dedicated capacity for WAIT vs CALL
+      Sell tower    — dedicated capacity for WAIT vs PUT
+      Fusion head   — combines buy/sell embeddings → final WAIT/CALL/PUT
+
+    Rationale: a single 3-way head mixed CALL/PUT gradients; specialists
+    learn side-specific setups, fusion arbitrates to one action.
+    '''
+
     def __init__(
         self,
         num_features: int = num_features,
-        input_dim: int = 28,
-        hidden_dim: int = 128,
-        num_actions: int = 5,
         ctx_dim: int = 28,
         q_lookback: int = q_lookback_bars,
+        hidden_dim: int = 128,
         num_horizons: int = 4,
         num_head_actions: int = 3,
+        tower_dim: int = 96,
     ):
         super().__init__()
         self.num_features = num_features
         self.ctx_dim = ctx_dim
         self.q_lookback = q_lookback
         self.num_horizons = num_horizons
+        self.tower_dim = tower_dim
 
-        # --- Branch A: full indicators (B, T, F) -> Conv1D ---
-        self.feat_conv1 = nn.Conv1d(num_features, 64, kernel_size=3, padding=1)
-        self.feat_bn1   = nn.BatchNorm1d(64)
+        # --- Shared Branch A: full indicators (B, T, F) ---
+        in_channels = max(num_features, 1)
+        self.feat_conv1 = nn.Conv1d(in_channels, 64, kernel_size=3, padding=1)
+        self.feat_bn1 = nn.BatchNorm1d(64)
         self.feat_conv2 = nn.Conv1d(64, 64, kernel_size=3, padding=1)
-        self.feat_bn2   = nn.BatchNorm1d(64)
-        self.feat_pool  = nn.AdaptiveAvgPool1d(1)
-        self.feat_fc    = nn.Linear(64, 64)
+        self.feat_bn2 = nn.BatchNorm1d(64)
+        self.feat_pool = nn.AdaptiveAvgPool1d(1)
+        self.feat_fc = nn.Linear(64, 64)
 
-        # --- Branch B: 28-dim context dense encoder ---
+        # --- Shared Branch B: 28-dim context ---
         self.b1_fc1 = nn.Linear(ctx_dim, hidden_dim)
         self.b1_ln1 = nn.LayerNorm(hidden_dim)
         self.b1_fc2 = nn.Linear(hidden_dim, 64)
         self.b1_ln2 = nn.LayerNorm(64)
 
-        self.b2_meta   = nn.Linear(10, 16)
-        self.b2_risk   = nn.Linear(5, 16)
-        self.b2_zone   = nn.Linear(8, 16)
-        self.b2_time   = nn.Linear(5, 16)
+        self.b2_meta = nn.Linear(10, 16)
+        self.b2_risk = nn.Linear(5, 16)
+        self.b2_zone = nn.Linear(8, 16)
+        self.b2_time = nn.Linear(5, 16)
         self.b2_fusion = nn.Linear(64, 64)
-        self.b2_ln     = nn.LayerNorm(64)
+        self.b2_ln = nn.LayerNorm(64)
 
-        # --- Fusion + per-horizon heads ---
+        # --- Shared fusion trunk ---
         self.fusion_fc = nn.Linear(64 + 64 + 64, hidden_dim)
         self.fusion_ln = nn.LayerNorm(hidden_dim)
 
-        self.horizon_heads = nn.ModuleList([
+        # --- Specialist towers (full MLPs — real capacity, not tiny heads) ---
+        def _tower():
+            return nn.Sequential(
+                nn.Linear(hidden_dim, tower_dim),
+                nn.LayerNorm(tower_dim),
+                nn.SiLU(),
+                nn.Dropout(0.1),
+                nn.Linear(tower_dim, tower_dim),
+                nn.LayerNorm(tower_dim),
+                nn.SiLU(),
+            )
+
+        self.buy_towers = nn.ModuleList([_tower() for _ in range(num_horizons)])
+        self.sell_towers = nn.ModuleList([_tower() for _ in range(num_horizons)])
+
+        # Side logits: Buy → [WAIT, CALL], Sell → [WAIT, PUT]
+        self.buy_side_heads = nn.ModuleList([
+            nn.Linear(tower_dim, 2) for _ in range(num_horizons)
+        ])
+        self.sell_side_heads = nn.ModuleList([
+            nn.Linear(tower_dim, 2) for _ in range(num_horizons)
+        ])
+
+        # Final decision fusion: [buy_emb | sell_emb | shared] → WAIT/CALL/PUT
+        self.decision_heads = nn.ModuleList([
             nn.Sequential(
+                nn.Linear(tower_dim + tower_dim + hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(0.1),
                 nn.Linear(hidden_dim, 64),
-                nn.LayerNorm(64),
                 nn.SiLU(),
                 nn.Linear(64, num_head_actions),
             )
@@ -667,39 +706,54 @@ class ExecutorQNetwork(nn.Module):
         return torch.nn.functional.silu(self.feat_fc(x))
 
     def _encode_ctx(self, ctx: torch.Tensor):
-        b1     = torch.nn.functional.silu(self.b1_ln1(self.b1_fc1(ctx)))
-        b1_out = torch.nn.functional.silu(self.b1_ln2(self.b1_fc2(b1)))
+        h = torch.nn.functional.silu(self.b1_ln1(self.b1_fc1(ctx)))
+        b1 = torch.nn.functional.silu(self.b1_ln2(self.b1_fc2(h)))
+        # Grouped context slices (must match static_states layout)
+        meta = torch.nn.functional.silu(self.b2_meta(ctx[:, 0:10]))
+        risk = torch.nn.functional.silu(self.b2_risk(ctx[:, 10:15]))
+        zone = torch.nn.functional.silu(self.b2_zone(ctx[:, 15:23]))
+        time = torch.nn.functional.silu(self.b2_time(ctx[:, 23:28]))
+        b2 = torch.nn.functional.silu(self.b2_ln(self.b2_fusion(torch.cat([meta, risk, zone, time], dim=-1))))
+        return b1, b2
 
-        meta_f = ctx[:, :10]
-        risk_f = ctx[:, 10:15]
-        zone_f = ctx[:, 15:23]
-        time_f = ctx[:, 23:28]
-        b2_cat = torch.cat([
-            torch.relu(self.b2_meta(meta_f)),
-            torch.relu(self.b2_risk(risk_f)),
-            torch.relu(self.b2_zone(zone_f)),
-            torch.relu(self.b2_time(time_f)),
-        ], dim=-1)
-        b2_out = torch.nn.functional.silu(self.b2_ln(self.b2_fusion(b2_cat)))
-        return b1_out, b2_out
-
-    def forward(
-        self,
-        feat_window: torch.Tensor,
-        ctx: torch.Tensor,
-        horizon_idx: Optional[int] = None,
-        return_aux: bool = False,
-    ):
-        feat_h         = self._encode_feat(feat_window)
+    def forward(self, feat_window: torch.Tensor, ctx: torch.Tensor, horizon_idx=None, return_sides=False):
+        '''
+        Returns:
+          default: (B, 3) logits WAIT/CALL/PUT for horizon_idx
+          if horizon_idx is None: (B, H, 3)
+          if return_sides: also buy_side (B,2), sell_side (B,2)
+        '''
+        feat_h = self._encode_feat(feat_window)
         b1_out, b2_out = self._encode_ctx(ctx)
         shared = torch.nn.functional.silu(
-            self.fusion_ln(
-                self.fusion_fc(torch.cat([feat_h, b1_out, b2_out], dim=-1))
-            )
+            self.fusion_ln(self.fusion_fc(torch.cat([feat_h, b1_out, b2_out], dim=-1)))
         )
+
+        def _one(h):
+            buy_e = self.buy_towers[h](shared)
+            sell_e = self.sell_towers[h](shared)
+            buy_side = self.buy_side_heads[h](buy_e)    # WAIT, CALL
+            sell_side = self.sell_side_heads[h](sell_e)  # WAIT, PUT
+            fused = self.decision_heads[h](torch.cat([buy_e, sell_e, shared], dim=-1))
+            return fused, buy_side, sell_side
+
         if horizon_idx is not None:
-            return self.horizon_heads[int(horizon_idx)](shared)
-        return torch.stack([h(shared) for h in self.horizon_heads], dim=1)
+            h = int(horizon_idx)
+            fused, buy_side, sell_side = _one(h)
+            if return_sides:
+                return fused, buy_side, sell_side
+            return fused
+
+        outs, buys, sells = [], [], []
+        for h in range(self.num_horizons):
+            f, b, s = _one(h)
+            outs.append(f)
+            buys.append(b)
+            sells.append(s)
+        stacked = torch.stack(outs, dim=1)
+        if return_sides:
+            return stacked, torch.stack(buys, dim=1), torch.stack(sells, dim=1)
+        return stacked
 
 print("✅ PyTorch Production Models Defined: SignalMetaNetwork & ExecutorQNetwork (100% 1:1 Match)")
 """
@@ -1612,16 +1666,16 @@ def generate_notebook(cells_def: list[dict], output_filename: str):
 
 
 def _build_cells(title: str) -> list:
-    """Single source of truth: read cells directly from notebook42ef966279(6).ipynb.
+    """Single source of truth: read cells directly from notebook2398f959dc_SIGNAL_SHAPED(6).ipynb.
     That file is the manually-maintained authoritative reference notebook.
     This avoids the circular self-reference of reading from the file we are generating.
     """
     import json
     import os
 
-    # notebook42ef966279(6).ipynb is the source of truth — maintained manually
+    # notebook2398f959dc_SIGNAL_SHAPED(6).ipynb is the source of truth — maintained manually
     source_nb_path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "../notebook42ef966279(6).ipynb")
+        os.path.join(os.path.dirname(__file__), "../../notebook2398f959dc_SIGNAL_SHAPED(6).ipynb")
     )
     with open(source_nb_path, "r", encoding="utf-8") as f:
         nb_src = json.load(f)
@@ -1648,13 +1702,13 @@ def _build_cells(title: str) -> list:
 
 def _build_keras_cells(title: str) -> list:
     """Build 100% native TensorFlow / Keras notebook cells.
-    Reads from notebook42ef966279(6).ipynb (source of truth), then applies Keras transformations.
+    Reads from notebook2398f959dc_SIGNAL_SHAPED(6).ipynb (source of truth), then applies Keras transformations.
     """
     import json
     import os
 
     source_nb_path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "../notebook42ef966279(6).ipynb")
+        os.path.join(os.path.dirname(__file__), "../../notebook2398f959dc_SIGNAL_SHAPED(6).ipynb")
     )
     with open(source_nb_path, "r", encoding="utf-8") as f:
         nb_src = json.load(f)

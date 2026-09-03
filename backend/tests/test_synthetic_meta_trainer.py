@@ -6,9 +6,14 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.market.dollar_index import DOLLAR_PAIRS, dollar_index_closes
 from app.core.market.mtf_rsi import detect_mtf_rsi_cross_signals
-from app.core.ml.signal_meta_learner import SIGNAL_META_FEATURE_COUNT, OnlineSignalMetaLearner
+from app.core.ml.signal_meta_learner import (
+    SIGNAL_META_FEATURE_COUNT,
+    SIGNAL_META_LOOKBACK_BARS,
+    OnlineSignalMetaLearner,
+)
 from app.core.ml.synthetic_meta_trainer import SyntheticTrainConfig, train_from_synthetic
 from app.core.ml.ti_meta_features import (
+    DECISION_FEATURE_COUNT,
     DECISION_WINDOW_DIM,
     TI_NUMERIC_FEATURE_KEYS,
     calculate_ti_features,
@@ -37,7 +42,8 @@ def db_session():
 
 def test_ti_contract_has_rich_feature_set():
     assert len(TI_NUMERIC_FEATURE_KEYS) >= 200
-    assert DECISION_WINDOW_DIM == SIGNAL_META_FEATURE_COUNT
+    assert DECISION_FEATURE_COUNT == SIGNAL_META_FEATURE_COUNT
+    assert DECISION_WINDOW_DIM == SIGNAL_META_LOOKBACK_BARS * SIGNAL_META_FEATURE_COUNT
     candles = [
         {
             "time": 1_700_000_000 + i * 3600,

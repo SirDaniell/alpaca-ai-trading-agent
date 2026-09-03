@@ -250,7 +250,7 @@ class MetaLearnerModelRegistry:
         b64 = (row.payload or {}).get("checkpoint_b64")
         if not b64:
             raise ValueError(f"Checkpoint {checkpoint_id} has no payload.")
-        learner = OnlineSignalMetaLearner(input_dim=SIGNAL_META_FEATURE_COUNT)
+        learner = OnlineSignalMetaLearner()
         learner.import_checkpoint(base64.b64decode(b64))
         self._active[symbol] = learner
 

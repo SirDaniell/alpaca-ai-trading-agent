@@ -108,10 +108,14 @@ class ExecutionContext:
 
 class ExecutorQNetwork(nn.Module):
     """
-    Dual-branch Q-network for LTF options execution (matches notebook Cell 6).
-    Branch A — Conv1D over the raw indicator feature window (B, T, F).
-    Branch B — Dense over the 28-dim meta/zone/account/time context.
-    Fusion   — 4 horizon heads × 3 actions (WAIT=0 / CALL=1 / PUT=2).
+    Dual-specialist Q net (per horizon):
+      Shared trunk  — Conv1D features + 28-dim context fusion
+      Buy tower     — dedicated capacity for WAIT vs CALL
+      Sell tower    — dedicated capacity for WAIT vs PUT
+      Fusion head   — combines buy/sell embeddings → final WAIT/CALL/PUT
+
+    Rationale: a single 3-way head mixed CALL/PUT gradients; specialists
+    learn side-specific setups, fusion arbitrates to one action.
     """
 
     def __init__(
@@ -124,22 +128,25 @@ class ExecutorQNetwork(nn.Module):
         q_lookback: int = Q_LOOKBACK,
         num_horizons: int = 4,
         num_head_actions: int = 3,
+        tower_dim: int = 96,
     ):
         super().__init__()
         self.num_features = num_features
         self.ctx_dim = ctx_dim
         self.q_lookback = q_lookback
         self.num_horizons = num_horizons
+        self.tower_dim = tower_dim
 
-        # --- Branch A: full indicator window (B, T, F) → channels-first Conv1D ---
-        self.feat_conv1 = nn.Conv1d(num_features, 64, kernel_size=3, padding=1)
+        # --- Shared Branch A: full indicator window (B, T, F) → channels-first Conv1D ---
+        in_channels = max(num_features, 1)
+        self.feat_conv1 = nn.Conv1d(in_channels, 64, kernel_size=3, padding=1)
         self.feat_bn1   = nn.BatchNorm1d(64)
         self.feat_conv2 = nn.Conv1d(64, 64, kernel_size=3, padding=1)
         self.feat_bn2   = nn.BatchNorm1d(64)
         self.feat_pool  = nn.AdaptiveAvgPool1d(1)
         self.feat_fc    = nn.Linear(64, 64)
 
-        # --- Branch B: 28-dim context dense encoder ---
+        # --- Shared Branch B: 28-dim context dense encoder ---
         self.b1_fc1 = nn.Linear(ctx_dim, hidden_dim)
         self.b1_ln1 = nn.LayerNorm(hidden_dim)
         self.b1_fc2 = nn.Linear(hidden_dim, 64)
@@ -152,14 +159,41 @@ class ExecutorQNetwork(nn.Module):
         self.b2_fusion = nn.Linear(64, 64)
         self.b2_ln     = nn.LayerNorm(64)
 
-        # --- Fusion + per-horizon heads ---
+        # --- Shared fusion trunk ---
         self.fusion_fc = nn.Linear(64 + 64 + 64, hidden_dim)  # feat_h + b1_out + b2_out
         self.fusion_ln = nn.LayerNorm(hidden_dim)
 
-        self.horizon_heads = nn.ModuleList([
+        # --- Specialist towers (full MLPs — real capacity, not tiny heads) ---
+        def _tower():
+            return nn.Sequential(
+                nn.Linear(hidden_dim, tower_dim),
+                nn.LayerNorm(tower_dim),
+                nn.SiLU(),
+                nn.Dropout(0.1),
+                nn.Linear(tower_dim, tower_dim),
+                nn.LayerNorm(tower_dim),
+                nn.SiLU(),
+            )
+
+        self.buy_towers = nn.ModuleList([_tower() for _ in range(num_horizons)])
+        self.sell_towers = nn.ModuleList([_tower() for _ in range(num_horizons)])
+
+        # Side logits: Buy → [WAIT, CALL], Sell → [WAIT, PUT]
+        self.buy_side_heads = nn.ModuleList([
+            nn.Linear(tower_dim, 2) for _ in range(num_horizons)
+        ])
+        self.sell_side_heads = nn.ModuleList([
+            nn.Linear(tower_dim, 2) for _ in range(num_horizons)
+        ])
+
+        # Final decision fusion: [buy_emb | sell_emb | shared] → WAIT/CALL/PUT
+        self.decision_heads = nn.ModuleList([
             nn.Sequential(
+                nn.Linear(tower_dim + tower_dim + hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(0.1),
                 nn.Linear(hidden_dim, 64),
-                nn.LayerNorm(64),
                 nn.SiLU(),
                 nn.Linear(64, num_head_actions),
             )
@@ -176,20 +210,14 @@ class ExecutorQNetwork(nn.Module):
 
     def _encode_ctx(self, ctx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encode 28-dim context → (b1_out(64), b2_out(64))."""
-        b1     = torch.nn.functional.silu(self.b1_ln1(self.b1_fc1(ctx)))
-        b1_out = torch.nn.functional.silu(self.b1_ln2(self.b1_fc2(b1)))
+        h      = torch.nn.functional.silu(self.b1_ln1(self.b1_fc1(ctx)))
+        b1_out = torch.nn.functional.silu(self.b1_ln2(self.b1_fc2(h)))
 
-        meta_f = ctx[:, :10]
-        risk_f = ctx[:, 10:15]
-        zone_f = ctx[:, 15:23]
-        time_f = ctx[:, 23:28]
-        b2_cat = torch.cat([
-            torch.relu(self.b2_meta(meta_f)),
-            torch.relu(self.b2_risk(risk_f)),
-            torch.relu(self.b2_zone(zone_f)),
-            torch.relu(self.b2_time(time_f)),
-        ], dim=-1)
-        b2_out = torch.nn.functional.silu(self.b2_ln(self.b2_fusion(b2_cat)))
+        meta = torch.nn.functional.silu(self.b2_meta(ctx[:, 0:10]))
+        risk = torch.nn.functional.silu(self.b2_risk(ctx[:, 10:15]))
+        zone = torch.nn.functional.silu(self.b2_zone(ctx[:, 15:23]))
+        time = torch.nn.functional.silu(self.b2_time(ctx[:, 23:28]))
+        b2_out = torch.nn.functional.silu(self.b2_ln(self.b2_fusion(torch.cat([meta, risk, zone, time], dim=-1))))
         return b1_out, b2_out
 
     def forward(
@@ -198,13 +226,15 @@ class ExecutorQNetwork(nn.Module):
         ctx: torch.Tensor,
         horizon_idx: Optional[int] = None,
         return_aux: bool = False,
-    ) -> torch.Tensor:
+        return_sides: bool = False,
+    ) -> Any:
         """
-        feat_window : (B, Q_LOOKBACK, num_features)
-        ctx         : (B, 28)
-        horizon_idx : int | None  — if set returns (B, 3) for that head only
-                                     otherwise returns (B, 4, 3)
-        return_aux  : kept for API compat, no-op in this architecture
+        feat_window  : (B, Q_LOOKBACK, num_features)
+        ctx          : (B, 28)
+        horizon_idx  : int | None  — if set returns (B, 3) for that head only
+                                      otherwise returns (B, 4, 3)
+        return_aux   : kept for API compat
+        return_sides : bool — if True also returns buy_side (B,2) and sell_side (B,2)
         """
         feat_h         = self._encode_feat(feat_window)
         b1_out, b2_out = self._encode_ctx(ctx)
@@ -213,9 +243,32 @@ class ExecutorQNetwork(nn.Module):
                 self.fusion_fc(torch.cat([feat_h, b1_out, b2_out], dim=-1))
             )
         )
+
+        def _one(h_idx_int):
+            buy_e = self.buy_towers[h_idx_int](shared)
+            sell_e = self.sell_towers[h_idx_int](shared)
+            buy_side = self.buy_side_heads[h_idx_int](buy_e)    # WAIT, CALL
+            sell_side = self.sell_side_heads[h_idx_int](sell_e)  # WAIT, PUT
+            fused = self.decision_heads[h_idx_int](torch.cat([buy_e, sell_e, shared], dim=-1))
+            return fused, buy_side, sell_side
+
         if horizon_idx is not None:
-            return self.horizon_heads[int(horizon_idx)](shared)
-        return torch.stack([h(shared) for h in self.horizon_heads], dim=1)
+            h = int(horizon_idx)
+            fused, buy_side, sell_side = _one(h)
+            if return_sides:
+                return fused, buy_side, sell_side
+            return fused
+
+        outs, buys, sells = [], [], []
+        for h in range(self.num_horizons):
+            f, b, s = _one(h)
+            outs.append(f)
+            buys.append(b)
+            sells.append(s)
+        stacked = torch.stack(outs, dim=1)
+        if return_sides:
+            return stacked, torch.stack(buys, dim=1), torch.stack(sells, dim=1)
+        return stacked
 
 
 # ── Module-level feature window helpers ──────────────────────────────────────
