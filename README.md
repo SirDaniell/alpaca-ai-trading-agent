@@ -1,3 +1,259 @@
+# AXE Genesis
+
+**Signal intelligence, meta-learning, and paper-trading research for Alpaca.**
+
+AXE Genesis is an experimental trading platform that combines causal market
+features, multi-timeframe context, a signal meta-learner, and a Q-learning
+execution layer behind a FastAPI service and React dashboard. It is built for
+research and paper-account experimentation, not as production trading advice
+or a guarantee of profitable or autonomous trading.
+
+> **Status:** Research prototype. Use paper credentials only. Review every
+> order path, risk control, and broker integration before considering any live
+> deployment.
+
+## Contents
+
+- [What is implemented](#what-is-implemented)
+- [Architecture](#architecture)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [API surface](#api-surface)
+- [Training and evaluation](#training-and-evaluation)
+- [Repository map](#repository-map)
+- [Documentation map](#documentation-map)
+- [Known limitations](#known-limitations)
+- [Contributing](#contributing)
+- [License](#license)
+
+## What is implemented
+
+| Area | Current state |
+| --- | --- |
+| FastAPI service | Implemented, with health, status, signal, logs, performance, and model routes. |
+| React dashboard | Implemented dashboard views for autopilot, performance, and models. |
+| Signal intelligence | Implemented causal feature generation, MTF RSI, DXY context, signal events, and support/resistance zones. |
+| Meta-learning | Implemented synthetic training, checkpoint persistence, model registry, and evaluation workflows. |
+| Q-executor | Experimental PyTorch/Keras learning and parity workflows; validate current checkpoints before use. |
+| Alpaca integration | Paper-account client and execution paths exist, but remain prototype code and require independent review. |
+| Live trading | Not supported or endorsed. |
+| MCP orchestration | Planned/deferred; do not assume an MCP server is available. |
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A[OHLCV and market context] --> B[Causal features\nMTF RSI, DXY, SNR zones]
+    B --> C[Tier 1\nSignal meta-learner]
+    C --> D[HTF bias package\nstrength, reversal, horizon]
+    D --> E[Tier 2\nQ-executor and action masks]
+    E --> F[Signal and outcome persistence]
+    F --> G[FastAPI service]
+    G --> H[React dashboard]
+    E -. paper integration boundary .-> I[Alpaca paper API]
+    J[Training notebooks and datasets] --> C
+    J --> E
+```
+
+The backend is organized around a staged learning loop: generate causal
+features, train or load the signal model, produce high-conviction transition
+memories, evaluate the Q-executor, and expose results for monitoring. Broker
+connectivity is an integration boundary; it does not make the research models
+production-safe by itself.
+
+## Quick start
+
+### Prerequisites
+
+- Python 3.10+ and the packages in `backend/requirements.txt`
+- Node.js and npm for the dashboard
+- Docker and Docker Compose for the PostgreSQL workflow
+- Alpaca **paper** credentials only when using broker-backed endpoints
+
+### Backend locally
+
+```bash
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Verify the service:
+
+```bash
+curl http://localhost:8000/health
+curl http://localhost:8000/status
+```
+
+Interactive API documentation is available at
+`http://localhost:8000/docs`; the OpenAPI document is at
+`http://localhost:8000/openapi.json`.
+
+### Frontend locally
+
+In a second terminal:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The frontend is a Vite/TanStack React application. Set
+`VITE_API_BASE_URL` when the backend is not running at its default URL:
+
+```bash
+VITE_API_BASE_URL=http://localhost:8000 npm run dev
+```
+
+### Docker Compose
+
+From the repository root, the canonical Compose workflow starts PostgreSQL
+and the backend on port `8000`:
+
+```bash
+docker compose up --build
+```
+
+The root Compose file uses the root `.env` for overrides and creates the
+`alpaca_agent` PostgreSQL database by default. Keep credentials in ignored
+`.env` files; never commit them.
+
+## Configuration
+
+Copy [backend/.env.example](backend/.env.example) to `backend/.env` and set
+the values required for your workflow. Important settings include:
+
+- `DATABASE_URL` for SQLite or PostgreSQL persistence
+- `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, and `ALPACA_BASE_URL`
+- `AGENT_LOOP_ENABLED` and `AGENT_LOOP_INTERVAL_SECONDS`
+- `MARKET_SYMBOLS`, `MARKET_TIMEFRAME`, and `MARKET_LOOKBACK_BARS`
+- `LEARNER_CHECKPOINT_VERSION` and `LEARNER_SCOPE`
+
+Generated datasets, logs, checkpoints, model weights, and archives are
+ignored by Git. See [.gitignore](.gitignore) before adding artifacts.
+
+## API surface
+
+The running FastAPI application is the authoritative API reference. The main
+route groups are:
+
+| Group | Routes | Purpose |
+| --- | --- | --- |
+| Health | `GET /health`, `GET /status` | Service and broker status |
+| Agent | `POST /agent/start`, `/agent/stop`, `/agent/run-cycle` | Agent controls and manual cycles |
+| Signals | `GET /signal/latest`, `POST /signal/bundle` | Signal inspection and generation |
+| Monitoring | `GET /logs`, `/positions`, `/performance/summary`, `/performance/trades` | Operational and performance views |
+| Models | `GET /models`, `POST /models/pretrain`, `POST /models/{id}/activate`, `DELETE /models/{id}` | Registry and checkpoint lifecycle |
+| Training | `POST /meta-learner/train-synthetic`, `GET /meta-learner/runs`, `/sessions/{id}`, `/checkpoints` | Synthetic training and run history |
+
+Treat control, order, and model-mutation routes as privileged operations. The
+dashboard is a monitoring and experimentation client, not a risk guarantee.
+
+## Training and evaluation
+
+Run backend commands from `backend/` with the project environment active.
+
+```bash
+# Run the backend test suite
+PYTHONPATH=. pytest tests/ -v --tb=short
+
+# Evaluate PyTorch or Keras expiry workflows
+PYTHONPATH=. python scripts/evaluate_option_expiries.py \
+  --symbols SPY --framework pytorch --limit 40000
+PYTHONPATH=. python scripts/evaluate_option_expiries.py \
+  --symbols SPY --framework keras --limit 40000
+
+# Inspect and manage registered model checkpoints
+python scripts/manage_meta_models.py list
+python scripts/manage_meta_models.py list --symbol AAPL
+```
+
+The maintained notebooks live in
+[`notebooks/training`](notebooks/training) and
+[`notebooks/kaggle`](notebooks/kaggle):
+
+- [Signal-shaped RL training](notebooks/training/axe_signal_shaped_rl_training.ipynb)
+- [Meta/Q learner synchronization](notebooks/training/axe_meta_q_learner_sync.ipynb)
+- [PyTorch Kaggle bundle](notebooks/kaggle/axe_meta_learner_training_pytorch.ipynb)
+- [Keras Kaggle bundle](notebooks/kaggle/axe_meta_learner_training_keras.ipynb)
+
+Large datasets and model artifacts are local/generated inputs and are
+intentionally excluded from the repository.
+
+## Repository map
+
+```text
+.
+├── backend/
+│   ├── app/
+│   │   ├── agent/                 # Scheduled signal and execution cycle
+│   │   ├── axe_paka_v1/            # Prototype model/runtime integration
+│   │   ├── core/
+│   │   │   ├── analysis/           # Technical and support/resistance features
+│   │   │   ├── market/             # MTF indicators, DXY, zones, signal events
+│   │   │   ├── ml/                 # Meta-learning, datasets, registries
+│   │   │   └── options/            # Options and Q-executor workflows
+│   │   ├── db/                     # SQLAlchemy models and persistence
+│   │   ├── main.py                 # FastAPI application and routes
+│   │   └── utils/                  # Alpaca client and shared utilities
+│   ├── scripts/                    # Training, evaluation, audit, and export CLIs
+│   ├── tests/                      # Backend and model tests
+│   ├── requirements.txt
+│   └── Dockerfile
+├── frontend/
+│   ├── src/routes/                 # Dashboard, performance, and model views
+│   ├── src/lib/                    # API and shared frontend utilities
+│   └── package.json
+├── notebooks/
+│   ├── training/                   # Maintained training and parity notebooks
+│   └── kaggle/                     # Generated PyTorch and Keras bundles
+├── docs/                           # Architecture, strategy, API, and handover notes
+├── data/                           # Ignored/generated datasets and logs
+├── checkpoints/                    # Ignored/generated model checkpoints
+├── docker-compose.yml              # Canonical local backend/PostgreSQL stack
+├── .gitignore                      # Artifact and secret exclusions
+└── README.md                       # This project entry point
+```
+
+## Documentation map
+
+| Need | Read |
+| --- | --- |
+| System handoff and signal flow | [Signal intelligence handoff](docs/agent_handoff_signal_intelligence.md) |
+| Competition architecture | [Competition signal architecture](docs/competition_signal_architecture.md) |
+| Strategy and options design | [Strategy](docs/strategy.md) and [Alpaca execution/PnL notes](docs/alpaca_trade_execution_and_pnl_docs.md) |
+| Frontend/API contract | [Frontend API contract and guide](docs/frontend_api_contract_and_guide.md) |
+| Model lifecycle | [Model update workflow](docs/model_update_workflow.md) |
+| Training architecture | [Q-learning architecture](Q_LEARNING_ARCHITECTURE.md) and [notebooks](notebooks/training) |
+| First-run onboarding | [START_HERE.md](START_HERE.md) |
+
+## Known limitations
+
+- This is not production trading software and has no profitability guarantee.
+- The execution path contains prototype assumptions and must be reviewed before
+  any broker-backed use.
+- Paper trading and model evaluation are not equivalent to live-market safety.
+- Data, checkpoints, and training outputs are not reproducible from Git alone;
+  acquire or generate the required local artifacts separately.
+- The parity verifier currently has a known gradient-detach failure; see the
+  test output before treating parity as complete.
+- MCP orchestration, hardened risk controls, and a production deployment path
+  remain planned work.
+
+## Contributing
+
+Keep changes focused and document new workflows beside the code that owns them.
+Before opening a change, run the relevant backend tests or frontend checks and
+update this README when setup commands, routes, or project ownership changes.
+Do not commit credentials, generated datasets, checkpoints, or model weights.
+
+## License
+
+See [LICENSE](LICENSE).
 <!-- audience:all -->
 # Alpaca AI Trading Agent
 

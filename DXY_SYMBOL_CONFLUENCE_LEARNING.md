@@ -517,7 +517,7 @@ File: backend/scripts/evaluate_option_expiries.py
 
 ### Step 2: Modify Q-Learning Training Loop
 ```
-File: notebook2398f959dc.ipynb (Cell 11)
+File: notebooks/training/axe_signal_shaped_rl_training.ipynb (Cell 11)
 ├─ Import compute_signal_quality_score()
 ├─ In training loop, compute signal_quality for each batch
 ├─ Replace reward with shaped_reward (Section 3 formula)
@@ -543,7 +543,7 @@ File: backend/app/core/ml/executor_q_network.py (mask_engine)
 
 ### Step 5: Evaluation Diagnostics
 ```
-File: notebook2398f959dc.ipynb (Cell 12)
+File: notebooks/training/axe_signal_shaped_rl_training.ipynb (Cell 12)
 ├─ Add column to trade logs: signal_quality, shaped_reward
 ├─ Plot: signal_quality distribution by outcome (WIN vs LOSS)
 │  └─ Should see: WIN trades cluster around 0.7-1.0 quality

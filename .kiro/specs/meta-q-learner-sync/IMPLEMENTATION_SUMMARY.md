@@ -264,7 +264,7 @@ Step 5: Verify parity with app code (post TensorFlow port)
 
 ### Phase 2 Start Instructions
 
-1. Open notebook: `backend/notebook42ef966279(6).ipynb`
+1. Open notebook: `notebooks/training/axe_meta_q_learner_sync.ipynb`
 2. Follow guide: [PHASE2_NOTEBOOK_SYNC_GUIDE.md](PHASE2_NOTEBOOK_SYNC_GUIDE.md)
 3. Update cells in order: 2A.1 → 2A.2 → 2A.3 → 2B.1 → 2B.2 → 2C.1 → 2C.2 → 2D
 4. Verify all cells execute without errors

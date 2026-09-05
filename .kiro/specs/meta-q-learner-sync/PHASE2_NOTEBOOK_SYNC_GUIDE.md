@@ -19,7 +19,7 @@
 
 ### Task 2A.1: Update Context Windows
 
-**File:** `backend/notebook42ef966279(6).ipynb`  
+**File:** `notebooks/training/axe_meta_q_learner_sync.ipynb`
 **Cell: Device Setup & Config**
 
 ```python
@@ -40,7 +40,7 @@ q_lookback_bars = 300         # Zone evolution analyst
 
 ### Task 2A.2: Update Meta-Learner Architecture
 
-**File:** `backend/notebook42ef966279(6).ipynb`  
+**File:** `notebooks/training/axe_meta_q_learner_sync.ipynb`
 **Cell: SignalMetaNetwork class definition**
 
 ```python
@@ -166,7 +166,7 @@ class SignalMetaNetwork(nn.Module):
 
 ### Task 2A.3: Update Q-Learner Architecture
 
-**File:** `backend/notebook42ef966279(6).ipynb`  
+**File:** `notebooks/training/axe_meta_q_learner_sync.ipynb`
 **Cell: ExecutorQNetwork class definition**
 
 ```python
@@ -276,7 +276,7 @@ class ExecutorQNetwork(nn.Module):
 
 ### Task 2B.1: Load Data from Backend Pipeline
 
-**File:** `backend/notebook42ef966279(6).ipynb`  
+**File:** `notebooks/training/axe_meta_q_learner_sync.ipynb`
 **Cell: Data Loading**
 
 ```python
@@ -323,7 +323,7 @@ print(f"ML targets: {sum(len(v) for v in ml_target_cols.values())} total")
 
 ### Task 2B.2: Create Data Loaders
 
-**File:** `backend/notebook42ef966279(6).ipynb`  
+**File:** `notebooks/training/axe_meta_q_learner_sync.ipynb`
 **Cell: PyTorch DataLoaders**
 
 ```python
@@ -376,7 +376,7 @@ print(f"Test batches: {len(test_loader)}")
 
 ### Task 2C.1: Multi-Head Loss Function
 
-**File:** `backend/notebook42ef966279(6).ipynb`  
+**File:** `notebooks/training/axe_meta_q_learner_sync.ipynb`
 **Cell: Loss Definition**
 
 ```python
@@ -471,7 +471,7 @@ loss_fn = MetaLearnerLoss()
 
 ### Task 2C.2: Training Loop
 
-**File:** `backend/notebook42ef966279(6).ipynb`  
+**File:** `notebooks/training/axe_meta_q_learner_sync.ipynb`
 **Cell: Training**
 
 ```python

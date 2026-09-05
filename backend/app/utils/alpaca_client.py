@@ -313,22 +313,37 @@ class AlpacaClient:
         qty: int,
         side: str,
         type: str = "market",
-        time_in_force: str = "day"
+        time_in_force: str = "day",
+        limit_price: Optional[float] = None,
     ) -> Optional[Dict]:
-        """Place an option order on Alpaca API (using asset_class='option')."""
+        """
+        Place an option order via Alpaca /v2/orders.
+
+        Per Alpaca docs (https://docs.alpaca.markets/us/docs/options-orders):
+        - symbol: OCC option symbol e.g. 'GLD260911C00200000'
+        - qty: whole number string
+        - side: 'buy' or 'sell'
+        - type: 'market' or 'limit'
+        - time_in_force: 'day' or 'gtc'
+        - NO asset_class field (it is NOT a valid param and causes rejection)
+        """
         try:
-            payload = {
+            payload: Dict = {
                 "symbol": symbol,
-                "qty": str(qty),
-                "side": side,
-                "type": type,
+                "qty": str(int(qty)),
+                "side": side.lower(),
+                "type": type.lower(),
                 "time_in_force": time_in_force,
-                "asset_class": "option",
             }
+            if type.lower() == "limit" and limit_price is not None:
+                payload["limit_price"] = str(limit_price)
             response = self.session.post(f"{self.base_url}/v2/orders", json=payload)
+            if not response.ok:
+                logger.error(f"Option order rejected [{response.status_code}]: {response.text}")
             response.raise_for_status()
-            logger.info(f"Option order placed: {symbol} {qty} {side}")
-            return response.json()
+            order = response.json()
+            logger.info(f"✅ Option order placed: {symbol} qty={qty} side={side} | id={order.get('id')}")
+            return order
         except Exception as e:
             logger.error(f"Failed to place option order for {symbol}: {e}")
             return None
@@ -464,31 +479,15 @@ class AlpacaClient:
         return all_bars[:limit]
 
 
-    def place_option_order(
-        self,
-        symbol: str,
-        qty: int,
-        side: str,
-        type: str = "market",
-        time_in_force: str = "day"
-    ) -> Optional[Dict]:
-        """Place an option order on Alpaca API (using asset_class='option')."""
+    def get_orders(self, status: str = "all", limit: int = 50) -> List[Dict]:
+        """Fetch orders by status ('open', 'closed', 'all')."""
         try:
-            payload = {
-                "symbol": symbol,
-                "qty": str(qty),
-                "side": side,
-                "type": type,
-                "time_in_force": time_in_force,
-                "asset_class": "option",
-            }
-            response = self.session.post(f"{self.base_url}/v2/orders", json=payload)
+            response = self.session.get(f"{self.base_url}/v2/orders", params={"status": status, "limit": limit})
             response.raise_for_status()
-            logger.info(f"Option order placed: {symbol} {qty} {side}")
             return response.json()
         except Exception as e:
-            logger.error(f"Failed to place option order for {symbol}: {e}")
-            return None
+            logger.error(f"Failed to fetch orders (status={status}): {e}")
+            return []
 
     def get_option_contracts(self, underlying_symbol: str, expiration_date_gte: Optional[str] = None) -> List[Dict]:
         """Fetch option contracts for an underlying ticker."""

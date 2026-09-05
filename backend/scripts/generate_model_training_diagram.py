@@ -1,6 +1,6 @@
 """
 generate_model_training_diagram.py — Generates a clean, retro-style model training flow diagram
-illustrating the AXE Genesis 2-Tier Training & Execution Concept from kaggle_axe_meta_learner_training.ipynb.
+illustrating the AXE Genesis 2-Tier Training & Execution Concept from notebooks/kaggle/axe_meta_learner_training_pytorch.ipynb.
 """
 
 import matplotlib

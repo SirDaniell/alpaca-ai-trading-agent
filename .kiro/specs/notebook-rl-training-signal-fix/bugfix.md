@@ -2,7 +2,7 @@
 
 ## Introduction
 
-The AXE Genesis RL training notebook (`notebook2398f959dc.ipynb`) contains seven confirmed bugs that collectively render the trained model indistinguishable from a random baseline. Phase 1 (SignalMetaNetwork) peaks at 52.89% validation win rate after 50 epochs — barely above 50% chance — and Phase 2 (DQN ExecutorQNetwork) degenerates to a WAIT-only policy. Out-of-sample win rate of 49.87% confirms the system produces no predictive signal.
+The AXE Genesis RL training notebook (`notebooks/training/axe_signal_shaped_rl_training.ipynb`) contains seven confirmed bugs that collectively render the trained model indistinguishable from a random baseline. Phase 1 (SignalMetaNetwork) peaks at 52.89% validation win rate after 50 epochs — barely above 50% chance — and Phase 2 (DQN ExecutorQNetwork) degenerates to a WAIT-only policy. Out-of-sample win rate of 49.87% confirms the system produces no predictive signal.
 
 The bugs span missing auxiliary targets, degenerate reward shaping, coin-flip supervision labels, a replay buffer that is destroyed every epoch, contradictory lookback constants, fully detached auxiliary heads, and un-normalized feature windows. This document captures the defective behaviors, the required correct behaviors, and the existing behaviors that must be preserved during the fix.
 

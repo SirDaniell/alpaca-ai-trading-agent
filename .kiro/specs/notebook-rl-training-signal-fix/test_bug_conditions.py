@@ -3,7 +3,7 @@ test_bug_conditions.py
 ======================
 Task 1 — Bug Condition Exploration Tests (Property 1: Bug Conditions)
 
-Seven sub-tests (1a–1g), one per confirmed bug in notebook2398f959dc.ipynb.
+Seven sub-tests (1a–1g), one per confirmed bug in notebooks/training/axe_signal_shaped_rl_training.ipynb.
 
 Each test:
   • Runs against UNFIXED notebook code (logic reproduced inline from cell inspection)

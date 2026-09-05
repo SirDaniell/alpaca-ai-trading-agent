@@ -245,6 +245,12 @@ class HardActionMask:
         nearest_supp, nearest_res = zone_manager.get_nearest_zones(current_price)
         prox_dist = max(atr * self.proximity_atr_mult, current_price * 0.003)
 
+        # Fallback: If no zones are populated in zone_manager yet, allow both entries
+        if nearest_supp is None and nearest_res is None:
+            mask[1] = 1
+            mask[2] = 1
+            return mask
+
         # ── Check BUY_CALL (Long at Support) ──────────────────────────────────
         if nearest_supp and not nearest_supp.is_invalidated:
             dist_to_supp = abs(current_price - nearest_supp.price_level)

@@ -19,7 +19,10 @@ import re
 
 DATA_DIR = "data"
 BUNDLE_ZIP_PATH = os.path.join(DATA_DIR, "axe_meta_dataset.zip")
-PYTORCH_NOTEBOOK_PATH = "kaggle_axe_meta_learner_training.ipynb"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+PYTORCH_NOTEBOOK_PATH = os.path.join(
+    PROJECT_ROOT, "notebooks/kaggle/axe_meta_learner_training_pytorch.ipynb"
+)
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -1648,7 +1651,9 @@ def export_all_checkpoints_zip(output_zip_path):
 export_all_checkpoints_zip(ZIP_EXPORT_PATH)
 """
 
-KERAS_NOTEBOOK_PATH = "kaggle_keras_meta_learner_training.ipynb"
+KERAS_NOTEBOOK_PATH = os.path.join(
+    PROJECT_ROOT, "notebooks/kaggle/axe_meta_learner_training_keras.ipynb"
+)
 
 def generate_notebook(cells_def: list[dict], output_filename: str):
     nb = {
@@ -1666,16 +1671,19 @@ def generate_notebook(cells_def: list[dict], output_filename: str):
 
 
 def _build_cells(title: str) -> list:
-    """Single source of truth: read cells directly from notebook2398f959dc_SIGNAL_SHAPED(6).ipynb.
+    """Read cells from the maintained signal-shaped RL training notebook.
     That file is the manually-maintained authoritative reference notebook.
     This avoids the circular self-reference of reading from the file we are generating.
     """
     import json
     import os
 
-    # notebook2398f959dc_SIGNAL_SHAPED(6).ipynb is the source of truth — maintained manually
+    # The signal-shaped notebook is the source of truth and is maintained manually.
     source_nb_path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "../../notebook2398f959dc_SIGNAL_SHAPED(6).ipynb")
+        os.path.join(
+            os.path.dirname(__file__),
+            "../../notebooks/training/axe_signal_shaped_rl_training.ipynb",
+        )
     )
     with open(source_nb_path, "r", encoding="utf-8") as f:
         nb_src = json.load(f)
@@ -1702,13 +1710,16 @@ def _build_cells(title: str) -> list:
 
 def _build_keras_cells(title: str) -> list:
     """Build 100% native TensorFlow / Keras notebook cells.
-    Reads from notebook2398f959dc_SIGNAL_SHAPED(6).ipynb (source of truth), then applies Keras transformations.
+    Reads from the signal-shaped RL training notebook (source of truth), then applies Keras transformations.
     """
     import json
     import os
 
     source_nb_path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "../../notebook2398f959dc_SIGNAL_SHAPED(6).ipynb")
+        os.path.join(
+            os.path.dirname(__file__),
+            "../../notebooks/training/axe_signal_shaped_rl_training.ipynb",
+        )
     )
     with open(source_nb_path, "r", encoding="utf-8") as f:
         nb_src = json.load(f)

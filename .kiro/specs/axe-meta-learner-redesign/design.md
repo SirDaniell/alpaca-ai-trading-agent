@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document defines the complete architecture, data flow, and parity contract between the Kaggle training notebook (`notebook42ef966279(6).ipynb`) and the in-house backend (`app/core/ml/signal_meta_learner.py`, `app/core/options/q_executor.py`).
+This document defines the complete architecture, data flow, and parity contract between the Kaggle training notebook (`notebooks/training/axe_meta_q_learner_sync.ipynb`) and the in-house backend (`app/core/ml/signal_meta_learner.py`, `app/core/options/q_executor.py`).
 
 Three confirmed bugs block training progress. Additionally, the Q-executor needs a dual-input architecture upgrade to match the notebook, and both systems need a regret buffer for missed-opportunity learning.
 

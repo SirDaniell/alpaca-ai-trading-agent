@@ -1,3 +1,20 @@
+# Generated datasets and data artifacts
+/data/
+/backend/data/
+*.csv
+
+# Model checkpoints and exported weights
+/checkpoints/
+/backend/checkpoints/
+/backend/app/axe_paka_v1/weights/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Dataset/model archives
+*.zip
+
 # Python
 __pycache__/
 *.pyc

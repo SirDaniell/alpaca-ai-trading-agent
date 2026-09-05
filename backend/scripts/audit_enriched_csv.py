@@ -122,6 +122,38 @@ def audit_frame(frame: pd.DataFrame, name: str = "train", allow_sparse: Iterable
                 direction_bad.append(column)
     result["non_binary_direction_targets"] = direction_bad
 
+    # ── NEW: Variance (std) gates — non-null ≠ useful ────────────────────────
+    TI_VARIANCE_COLS = ["ATR_5m", "EMA_8_5m", "EMA_12_5m", "Bar_Volume_Up_5m", "MACD_5m", "OBV_5m"]
+    ti_zero_cols = [
+        col for col in TI_VARIANCE_COLS
+        if col in frame.columns and pd.to_numeric(frame[col], errors="coerce").std() < 1e-6
+    ]
+    result["ti_constant_zero_cols"] = ti_zero_cols
+
+    # Zone targets must have more than 1 unique class
+    zone_degenerate = []
+    for col in ("adv_target_next_zone_idx", "adv_target_next_zone_type"):
+        if col in frame.columns:
+            n_unique = pd.to_numeric(frame[col], errors="coerce").nunique()
+            if n_unique <= 1:
+                zone_degenerate.append(f"{col} (nunique={n_unique})")
+    result["zone_degenerate_targets"] = zone_degenerate
+
+    # Vol/regime/velocity targets must have std > 0
+    vel_zero = [
+        col for col in ("Volatility_Bull_next", "Volatility_Bear_next", "Price_Velocity_Bull_next",
+                        "Price_Velocity_Bear_next", "Regime_Speed_Bull_next", "vel_bull_fwd_8")
+        if col in frame.columns and pd.to_numeric(frame[col], errors="coerce").std() < 1e-6
+    ]
+    result["constant_regime_velocity_targets"] = vel_zero
+
+    # Summary of TI key stats for quick inspection
+    result["ti_key_stats"] = {
+        col: {"std": float(pd.to_numeric(frame[col], errors="coerce").std()),
+              "zeros_pct": float((pd.to_numeric(frame[col], errors="coerce") == 0).mean() * 100)}
+        for col in TI_VARIANCE_COLS if col in frame.columns
+    }
+
     failures = []
     if missing:
         failures.append(f"missing required columns: {missing}")
@@ -135,9 +167,16 @@ def audit_frame(frame: pd.DataFrame, name: str = "train", allow_sparse: Iterable
         failures.append("rsi_5m mean is outside (20, 80)")
     if result["rsi_5m_std"] is None or result["rsi_5m_std"] >= 40.0:
         failures.append("rsi_5m standard deviation is >= 40")
+    if ti_zero_cols:
+        failures.append(f"TI columns are constant-zero (std≈0): {ti_zero_cols}")
+    if zone_degenerate:
+        failures.append(f"Zone targets are degenerate: {zone_degenerate}")
+    if vel_zero:
+        failures.append(f"Regime/velocity targets are constant-zero: {vel_zero}")
     result["failures"] = failures
     result["passed"] = not failures
     return result
+
 
 
 def main() -> int:

@@ -1,28 +1,43 @@
-# Glassmorphic Dashboard
+# AXE Genesis Dashboard
 
-read the documentation, know the style is mobile first,  modern glassmorphic minimal apple style  no glow no gradients,  , then blue/red/gold/silver   additives for buttons etc... here is the github repo https://github.com/SirDaniell/alpaca-ai-trading-agent <<>>  but its too large so dont waste tokens on it ... nut the |Frontend is typescript npm round edge
+This directory contains the Vite/TanStack React dashboard for AXE Genesis. It
+provides monitoring and model-management views backed by the FastAPI service;
+it is not a standalone trading application.
 
-make sure even though mobile first its responsive even on desktop mode... and make sure you read the md so we have all conttrols and displays...  we can have the background a gradient  ? 
+See the [root README](../README.md) for the complete architecture and setup
+guide, and the [frontend/API contract](../docs/frontend_api_contract_and_guide.md)
+for the integration details.
 
-lively and attractive
+## Views
 
-This project was built with [Lovable](https://lovable.dev).
-
-## Build with Lovable
-
-Continue developing this project in the [Lovable editor](https://lovable.dev/projects/1be8779f-d0bb-41ad-9949-c39c73070807).
-
-- **Ship faster**: describe what you want to build and Lovable handles the code.
-- **Stay in sync**: every change made in Lovable is committed straight to this repository.
-- **Full ownership**: this code is yours. Push to `main` on GitHub and your changes sync back into Lovable, ready for your next prompt.
+- `/` — autopilot dashboard and current system state
+- `/performance` — performance and trade analytics
+- `/models` — model registry and training controls
 
 ## Development
 
-Prefer working locally? You need Node.js and npm — [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating).
+Requirements: Node.js and npm.
 
-```sh
-git clone <this-repository-url>
-cd <repository-name>
-npm i
+```bash
+cd frontend
+npm install
 npm run dev
 ```
+
+The dev server normally runs on the Vite port shown in the terminal. Configure
+the backend URL when needed:
+
+```bash
+VITE_API_BASE_URL=http://localhost:8000 npm run dev
+```
+
+Available checks:
+
+```bash
+npm run lint
+npm run build
+npm run preview
+```
+
+The backend must be running for live data, controls, and model operations.
+Do not commit `.env` files or API credentials.

@@ -2,7 +2,7 @@
 
 ## Overview
 
-`notebook2398f959dc.ipynb` trains a two-phase model for options trading: Phase 1 is a `SignalMetaNetwork` (multi-task supervised learning for direction, strength, pips, risk, and liquidity) and Phase 2 is a DQN `ExecutorQNetwork` that uses frozen Phase 1 outputs as part of its state. Seven confirmed bugs collectively prevent the pipeline from producing a model better than random chance. Observed symptoms include: Phase 1 validation win rate peaking at ~52.89% (barely above 50% random baseline), strength outputs stuck near 0.528 across all epochs, Q-loss collapsing to 1e-5 (degenerate WAIT policy), and Phase 3 out-of-sample win rate of 49.87% (indistinguishable from coin-flip always-CALL at 49.91% or always-PUT at 50.61%).
+`notebooks/training/axe_signal_shaped_rl_training.ipynb` trains a two-phase model for options trading: Phase 1 is a `SignalMetaNetwork` (multi-task supervised learning for direction, strength, pips, risk, and liquidity) and Phase 2 is a DQN `ExecutorQNetwork` that uses frozen Phase 1 outputs as part of its state. Seven confirmed bugs collectively prevent the pipeline from producing a model better than random chance. Observed symptoms include: Phase 1 validation win rate peaking at ~52.89% (barely above 50% random baseline), strength outputs stuck near 0.528 across all epochs, Q-loss collapsing to 1e-5 (degenerate WAIT policy), and Phase 3 out-of-sample win rate of 49.87% (indistinguishable from coin-flip always-CALL at 49.91% or always-PUT at 50.61%).
 
 This document describes the bug conditions for all seven bugs, the expected correct behaviors, hypothesized root causes based on code inspection, and the implementation and testing strategy. The notebook contains partial fixes already applied (Bugs 1, 2, and 4 have attempts in the current code); the remaining work addresses Bugs 3, 5, 6, and 7 fully, and hardens the partial fixes for Bugs 1, 2, and 4.
 
@@ -13,7 +13,7 @@ This document describes the bug conditions for all seven bugs, the expected corr
 - **Bug_Condition (C)**: The input condition that triggers one of the seven defective behaviors
 - **Property (P)**: The desired correct behavior when the bug condition holds
 - **Preservation**: Behaviors that must remain unchanged after the fix — five output heads with correct shapes, frozen Phase 1 weights before Phase 2, PnL-based CALL/PUT rewards, and end-to-end notebook execution
-- **`SignalMetaNetwork`**: The Phase 1 model in Cell 6 (`notebook2398f959dc.ipynb`), a multi-branch Conv1D+LSTM+Fusion network with six output heads: direction (`q_head`), strength, pips, risk, liquidity, reversal
+- **`SignalMetaNetwork`**: The Phase 1 model in Cell 6 (`notebooks/training/axe_signal_shaped_rl_training.ipynb`), a multi-branch Conv1D+LSTM+Fusion network with six output heads: direction (`q_head`), strength, pips, risk, liquidity, reversal
 - **`ExecutorQNetwork`**: The Phase 2 DQN in Cell 7, dual-input (feature window + 28-dim context), with four independent horizon heads each producing 3 Q-values (WAIT/CALL/PUT)
 - **`build_feat_window`**: The helper in Cell 7 that slices `(q_lookback, num_features)` raw feature windows for the Q-network
 - **`_rebuild_targets`**: The target-construction function in Cell 9 that computes ATR-normalized soft strength and pips targets from close prices
@@ -341,7 +341,7 @@ All five of the remaining/incomplete fixes assume the root cause analyses above 
 
 ### Fix 6 — Remove `.detach()` from Auxiliary Head Inputs (Cell 6)
 
-**File**: `notebook2398f959dc.ipynb`, Cell 6 (`SignalMetaNetwork.forward`)
+**File**: `notebooks/training/axe_signal_shaped_rl_training.ipynb`, Cell 6 (`SignalMetaNetwork.forward`)
 
 **Lines to change**: 127–128, 141–142
 
@@ -385,7 +385,7 @@ reversal  = self.reversal_head(self.rev_ln(self.rev_proj(branch_cat)))
 
 ### Fix 3 — Zone-Conditional Direction Labels (Cell 9)
 
-**File**: `notebook2398f959dc.ipynb`, Cell 9
+**File**: `notebooks/training/axe_signal_shaped_rl_training.ipynb`, Cell 9
 
 **Function**: Target construction block, after `_rebuild_targets` is called
 
@@ -431,7 +431,7 @@ print(f"[Bug3-fix] Effective direction label positive rate: {effective_pos_rate:
 
 ### Fix 5 — Consolidate Q_LOOKBACK to Single Definition (Cells 2, 7, 10)
 
-**File**: `notebook2398f959dc.ipynb`, Cells 2, 7, and 10
+**File**: `notebooks/training/axe_signal_shaped_rl_training.ipynb`, Cells 2, 7, and 10
 
 **Specific Changes**:
 
@@ -458,7 +458,7 @@ print(f"[Bug3-fix] Effective direction label positive rate: {effective_pos_rate:
 
 ### Fix 1 — Harden ML Target Synthesis and Gating (Cells 8 and 9)
 
-**File**: `notebook2398f959dc.ipynb`, Cell 8
+**File**: `notebooks/training/axe_signal_shaped_rl_training.ipynb`, Cell 8
 
 **Revised approach**: Zone targets (`adv_target_next_zone_*`) are synthesized from `snr_support_5m`, `snr_resistance_5m`, `snr_dist_support_5m`, `snr_dist_resistance_5m` columns already in the CSV. A forward-looking loop over the next 12 bars computes minimum ATR-normalized distance to zones, bars-to-proximity, and zone type. A new `_fill_ml_targets_phase1()` function replaces the bare `_fill_ml_targets()` redefinition in Phase 1 to prevent zero-overwrite: it checks if the synthesizer is available and falls back to it when CSV columns are all-zero. This synthesizes all 18 non-CSM targets (previously only 14) and makes all zone targets active in the loss.
 
@@ -472,7 +472,7 @@ print(f"[Bug3-fix] Effective direction label positive rate: {effective_pos_rate:
 
 ### Fix 2 — Strengthen WAIT Reward Robustness (Cell 10)
 
-**File**: `notebook2398f959dc.ipynb`, Cell 10
+**File**: `notebooks/training/axe_signal_shaped_rl_training.ipynb`, Cell 10
 
 **Alternative fix (preferred)**: **Signal-quality shaping approach**: Instead of only changing the WAIT penalty, introduce `compute_signal_quality_score(action, meta_strength_h, dir_flag, supp_dist, res_dist, vol_delta_ratio, row)` which computes a quality score [0,1] from 5 components: meta conviction (25%), directional alignment with RSI-diff if available (25%), zone proximity using CSV `snr_dist_*` columns (20%), volume confirmation (10%), MTF SNR confluence and DXY alignment (20%). Then `compute_shaped_reward(base_reward, signal_quality)` adds `ALIGNMENT_WEIGHT * SHAPING_SCALE * quality_centered` to any base reward. This rewards high-quality CALL/PUT trades more than low-quality ones, raising the ceiling rather than only lowering the WAIT floor.
 
@@ -511,7 +511,7 @@ print(f"[Bug3-fix] Effective direction label positive rate: {effective_pos_rate:
 
 ### Fix 4 — Harden Replay Buffer (Cell 10)
 
-**File**: `notebook2398f959dc.ipynb`, Cell 10
+**File**: `notebooks/training/axe_signal_shaped_rl_training.ipynb`, Cell 10
 
 **Specific Changes**:
 
@@ -538,7 +538,7 @@ print(f"[Bug3-fix] Effective direction label positive rate: {effective_pos_rate:
 
 ### Fix 7 — Per-Window Feature Normalization (Cell 7)
 
-**File**: `notebook2398f959dc.ipynb`, Cell 7
+**File**: `notebooks/training/axe_signal_shaped_rl_training.ipynb`, Cell 7
 
 **Function**: `build_feat_window`
 

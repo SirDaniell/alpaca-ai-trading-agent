@@ -1,5 +1,5 @@
 # Q-Learning Architecture & Decision-Making System
-## Complete Technical Analysis from notebook2398f959dc.ipynb
+## Complete Technical Analysis from notebooks/training/axe_signal_shaped_rl_training.ipynb
 
 ---
 
@@ -528,14 +528,14 @@ Recommendation:
 
 | Component | File | Notebook Cell | Purpose |
 |-----------|------|---------|---------|
-| Meta-Learner Setup | notebook2398f959dc.ipynb | Cell 9 (913-1100) | Initialize SignalMetaNetwork + targets |
-| Target Extraction | notebook2398f959dc.ipynb | Cell 9 (1000-1100) | _extract_targets() function |
-| Q-Network Definition | notebook2398f959dc.ipynb | Cell 6 | ExecutorQNetwork class |
-| Training Loop | notebook2398f959dc.ipynb | Cell 11 (1387-1821) | Phase 2 Q-learning with replay buffers |
-| Inference Setup | notebook2398f959dc.ipynb | Cell 12 (1824-2050) | Precompute meta features & zones |
-| Phase 3a/3b Eval | notebook2398f959dc.ipynb | Cell 12 (2050-2300) | Decision functions + masking |
-| Money Mgmt | notebook2398f959dc.ipynb | Cell 12 (1930-2000) | Martingale + Kelly helpers |
-| Phase 4 Portfolio | notebook2398f959dc.ipynb | Cell 12 (2320-2387) | Concurrent multi-horizon trading |
+| Meta-Learner Setup | notebooks/training/axe_signal_shaped_rl_training.ipynb | Cell 9 (913-1100) | Initialize SignalMetaNetwork + targets |
+| Target Extraction | notebooks/training/axe_signal_shaped_rl_training.ipynb | Cell 9 (1000-1100) | _extract_targets() function |
+| Q-Network Definition | notebooks/training/axe_signal_shaped_rl_training.ipynb | Cell 6 | ExecutorQNetwork class |
+| Training Loop | notebooks/training/axe_signal_shaped_rl_training.ipynb | Cell 11 (1387-1821) | Phase 2 Q-learning with replay buffers |
+| Inference Setup | notebooks/training/axe_signal_shaped_rl_training.ipynb | Cell 12 (1824-2050) | Precompute meta features & zones |
+| Phase 3a/3b Eval | notebooks/training/axe_signal_shaped_rl_training.ipynb | Cell 12 (2050-2300) | Decision functions + masking |
+| Money Mgmt | notebooks/training/axe_signal_shaped_rl_training.ipynb | Cell 12 (1930-2000) | Martingale + Kelly helpers |
+| Phase 4 Portfolio | notebooks/training/axe_signal_shaped_rl_training.ipynb | Cell 12 (2320-2387) | Concurrent multi-horizon trading |
 
 ---
 

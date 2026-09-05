@@ -277,7 +277,9 @@ except Exception as e:
 print("\n── Notebook Cell Checks (JSON) ─────────────────────────────────────────")
 try:
     import json
-    nb_path = os.path.join(BACKEND, 'notebook42ef966279(6).ipynb')
+    nb_path = os.path.join(
+        BACKEND, '..', 'notebooks', 'training', 'axe_meta_q_learner_sync.ipynb'
+    )
     with open(nb_path) as f:
         nb = json.load(f)
     cells = nb['cells']

@@ -6,6 +6,7 @@ seamlessly by backend production models (SignalMetaNetwork & ExecutorQNetwork) w
 """
 
 import json
+from pathlib import Path
 import torch
 import torch.nn as nn
 import numpy as np
@@ -42,7 +43,11 @@ def get_notebook_model_classes():
     """Extract SignalMetaNetwork and ExecutorQNetwork from the generated Kaggle Notebook.
     The notebook now follows the source notebook structure: each class is in its own cell.
     """
-    with open("kaggle_axe_meta_learner_training.ipynb", "r") as f:
+    notebook_path = (
+        Path(__file__).resolve().parents[2]
+        / "notebooks/kaggle/axe_meta_learner_training_pytorch.ipynb"
+    )
+    with notebook_path.open("r", encoding="utf-8") as f:
         nb = json.load(f)
 
     meta_cell = eq_cell = None

@@ -33,7 +33,9 @@ _SPEC_DIR     = os.path.dirname(os.path.realpath(__file__))
 # project root is 3 levels up  (.kiro/specs/<spec-name>/ → ../ → ../ → ../)
 _PROJECT_ROOT = os.path.normpath(os.path.join(_SPEC_DIR, "..", "..", ".."))
 
-NOTEBOOK_PATH = os.path.join(_PROJECT_ROOT, "notebook2398f959dc.ipynb")
+NOTEBOOK_PATH = os.path.join(
+    _PROJECT_ROOT, "notebooks", "training", "axe_signal_shaped_rl_training.ipynb"
+)
 CSV_PATH      = os.path.join(_PROJECT_ROOT, "backend", "data", "train_50k.csv")
 
 pass_count = 0

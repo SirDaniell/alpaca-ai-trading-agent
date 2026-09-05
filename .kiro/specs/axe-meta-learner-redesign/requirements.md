@@ -2,7 +2,7 @@
 
 ## Introduction
 
-The current AXE Genesis training pipeline (`notebook42ef966279(6).ipynb`) has two active bugs blocking training progress, and the broader architecture needs redesigning to take advantage of the rich target labels already produced by `ml_dataset_preparation.py`. Additionally, the notebook and the in-house backend code (`app/core/ml/`) have diverged and need to be reconciled cell by cell to ensure 1:1 parity.
+The current AXE Genesis training pipeline (`notebooks/training/axe_meta_q_learner_sync.ipynb`) has two active bugs blocking training progress, and the broader architecture needs redesigning to take advantage of the rich target labels already produced by `ml_dataset_preparation.py`. Additionally, the notebook and the in-house backend code (`app/core/ml/`) have diverged and need to be reconciled cell by cell to ensure 1:1 parity.
 
 The central question the system must answer is: **"Given a market context, what is the best option expiry horizon for this trade — 5m, 15m, 30m, or 1h?"**
 
